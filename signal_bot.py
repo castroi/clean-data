@@ -7,7 +7,7 @@ from pathlib import Path
 
 from pysignalclirestapi import SignalCliRestApi
 
-from config import Config
+from config import Config, parse_allowed_senders
 from processor.pipeline import CleaningPipeline, ProcessingTimeout
 from utils.secure_delete import secure_delete, secure_delete_dir
 
@@ -43,10 +43,7 @@ class SignalBot:
         self._rate_limits: dict[str, list[float]] = defaultdict(list)
 
         # Optional allowlist: comma-separated phone numbers in env var
-        allowed = getattr(self._config, "ALLOWED_SENDERS", "")
-        self._allowed_senders: set[str] = {
-            s.strip() for s in allowed.split(",") if s.strip()
-        } if allowed else set()
+        self._allowed_senders: set[str] = parse_allowed_senders(self._config.ALLOWED_SENDERS)
 
     def _is_rate_limited(self, sender: str) -> bool:
         """Check if sender has exceeded the rate limit."""
