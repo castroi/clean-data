@@ -35,7 +35,7 @@ COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /root/.cache/huggingface /home/cleandata/.cache/huggingface
 
 # Copy application source
-COPY config.py main.py signal_bot.py ./
+COPY config.py main.py signal_bot.py word_session_store.py ./
 COPY processor/ ./processor/
 COPY utils/ ./utils/
 
