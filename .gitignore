@@ -1,0 +1,16 @@
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+/tmp/
+*.tmp
+.mypy_cache/
+.ruff_cache/
+huggingface/
+transformers_cache/
+signal-cli-config/
