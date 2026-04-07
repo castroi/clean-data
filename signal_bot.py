@@ -8,8 +8,10 @@ from pathlib import Path
 from pysignalclirestapi import SignalCliRestApi
 
 from config import Config, parse_allowed_senders
+from processor.custom_word_detector import CustomWordDetector
 from processor.pipeline import CleaningPipeline, ProcessingTimeout
 from utils.secure_delete import secure_delete, secure_delete_dir
+from word_session_store import WordSessionStore
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +24,10 @@ USAGE_MESSAGE = (
     "all personal data (names, IDs, addresses, emails, phone numbers) and "
     "document metadata.\n\n"
     "Supported formats: PDF, DOCX\n"
-    "Max file size: {max_size}MB"
+    "Max file size: {max_size}MB\n\n"
+    "Commands:\n"
+    "/replace word1, word2, ... — remove specific words instead of automatic PII detection\n"
+    "/end — clear custom words and restore automatic PII detection"
 )
 
 
@@ -44,6 +49,9 @@ class SignalBot:
 
         # Optional allowlist: comma-separated phone numbers in env var
         self._allowed_senders: set[str] = parse_allowed_senders(self._config.ALLOWED_SENDERS)
+
+        # Per-sender custom word sessions for /replace command
+        self._word_store = WordSessionStore(ttl_seconds=self._config.WORD_SESSION_TTL_SECONDS)
 
     def _is_rate_limited(self, sender: str) -> bool:
         """Check if sender has exceeded the rate limit."""
@@ -94,6 +102,13 @@ class SignalBot:
             logger.warning("Rejected message from unauthorized sender: %s", sender)
             return
 
+        # Command handling — must happen before attachment check
+        if message and message.strip().startswith("/"):
+            self._handle_command(sender, message.strip())
+            # If the message has no attachments, we're done
+            if not attachments:
+                return
+
         if not attachments:
             self._send_message(
                 sender,
@@ -106,6 +121,28 @@ class SignalBot:
                 self._send_message(sender, "Rate limit exceeded. Please wait before sending more files.")
                 return
             self._process_attachment(sender, attachment)
+
+    def _handle_command(self, sender: str, message: str) -> None:
+        """Handle a /command message from a sender."""
+        if message.lower().startswith("/replace "):
+            raw_words = message[len("/replace "):]
+            words = [w.strip() for w in raw_words.split(",") if w.strip()]
+            if not words:
+                self._send_message(sender, "Usage: /replace word1, word2, word3")
+                return
+            all_words = self._word_store.add_words(sender, words)
+            word_list = ", ".join(all_words)
+            self._send_message(
+                sender,
+                f"Custom words set ({len(all_words)}): {word_list}\n"
+                f"These words will be removed from documents sent in the next hour.\n"
+                f"Send /end to clear.",
+            )
+        elif message.lower().strip() == "/end":
+            self._word_store.clear(sender)
+            self._send_message(sender, "Custom words cleared. Back to automatic PII detection.")
+        else:
+            self._send_message(sender, "Unknown command. Available: /replace, /end")
 
     def _process_attachment(self, sender: str, attachment: dict) -> None:
         """Process a single file attachment."""
@@ -162,8 +199,13 @@ class SignalBot:
                 return
             input_path.write_bytes(content)
 
+            # Choose detector: custom words override default PII detection
+            detector = None
+            if self._word_store.has_active_session(sender):
+                detector = CustomWordDetector(self._word_store.get_words(sender))
+
             # Process
-            cleaned_path = self._pipeline.process(input_path)
+            cleaned_path = self._pipeline.process(input_path, detector=detector)
 
             # Send back
             self._send_attachment(
