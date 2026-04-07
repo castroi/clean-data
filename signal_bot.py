@@ -90,8 +90,8 @@ class SignalBot:
             attachments: List of attachment dicts with 'filename', 'id', 'size' keys.
         """
         # Allowlist check (if configured)
-        if self._allowed_senders and sender not in self._allowed_senders:
-            logger.warning("Rejected message from unauthorized sender")
+        if self._allowed_senders and sender.lower() not in self._allowed_senders:
+            logger.warning("Rejected message from unauthorized sender: %s", sender)
             return
 
         if not attachments:
@@ -213,17 +213,22 @@ class SignalBot:
                 messages = self._api.receive()
                 for msg in messages:
                     envelope = msg.get("envelope", {})
-                    source = envelope.get("source", "")
+                    account = msg.get("account", "")
                     data_message = envelope.get("dataMessage", {})
 
-                    if not source or not data_message:
+                    if not account or not data_message:
+                        continue
+
+                    sender = envelope.get("sourceUuid") or envelope.get("sourceNumber") or ""
+                    if not sender:
+                        logger.warning("Message with no sender identifier, skipping")
                         continue
 
                     text = data_message.get("message", "")
                     attachments = data_message.get("attachments", [])
 
                     self.handle_message(
-                        sender=source,
+                        sender=sender,
                         message=text,
                         attachments=attachments if attachments else None,
                     )

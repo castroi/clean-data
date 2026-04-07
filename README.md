@@ -162,7 +162,7 @@ All configuration is done via environment variables or a `.env` file.
 | `TEMP_DIR` | Temporary file directory | `/tmp/clean-data` |
 | `MAX_FILE_SIZE_MB` | Maximum accepted file size in MB | `25` |
 | `PROCESSING_TIMEOUT` | Maximum processing time in seconds | `300` |
-| `ALLOWED_SENDERS` | Comma-separated allowlist of phone numbers | (all senders allowed) |
+| `ALLOWED_SENDERS` | Comma-separated allowlist of Signal UUIDs | (all senders allowed) |
 
 For strongest PII protection, mount `TEMP_DIR` on a `tmpfs` volume so temporary files never touch disk.
 
@@ -222,7 +222,7 @@ pytest tests/test_signal_bot.py -v
 - All processing is local — documents never leave the machine
 - Files are securely overwritten (random bytes followed by zeros) before deletion
 - Rate limiting: 5 files per 60 seconds per sender
-- Optional sender allowlist restricts access to trusted phone numbers
+- Optional sender allowlist restricts access to trusted Signal UUIDs
 - Filename sanitization prevents path traversal attacks
 - Stale temporary files are purged on startup
 - No PII is written to logs — exception details are logged at DEBUG level only

@@ -10,15 +10,18 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-_VALID_PHONE_RE = re.compile(r'^[0-9+\-]+$')
+_VALID_UUID_RE = re.compile(
+    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
+    re.IGNORECASE,
+)
 
 
 def parse_allowed_senders(raw: str) -> set[str]:
-    """Parse a comma-separated string of phone numbers into a set of cleaned numbers.
+    """Parse a comma-separated string of Signal UUIDs into a set.
 
-    Each entry is stripped of surrounding whitespace and internal spaces.
-    Entries that contain characters other than digits, '+', or '-' are logged
-    as a warning and skipped.  Returns an empty set for empty/whitespace input.
+    Each entry is stripped of surrounding whitespace and lowercased.
+    Entries that are not valid UUIDs are logged as a warning and skipped.
+    Returns an empty set for empty/whitespace input.
     """
     if not raw or not raw.strip():
         return set()
@@ -28,19 +31,10 @@ def parse_allowed_senders(raw: str) -> set[str]:
         stripped = entry.strip()
         if not stripped:
             continue
-        # Remove all internal spaces (formatting artefacts like "+17 8900")
-        cleaned = stripped.replace(" ", "")
-        if not cleaned:
+        cleaned = stripped.lower()
+        if not _VALID_UUID_RE.match(cleaned):
+            logger.warning("Skipping invalid UUID in ALLOWED_SENDERS: %r", stripped)
             continue
-        if not _VALID_PHONE_RE.match(cleaned):
-            logger.warning("Skipping invalid phone number in ALLOWED_SENDERS: %r", stripped)
-            continue
-        # Normalize to E.164: strip dashes so "+1-555-1234" matches "+15551234" from Signal
-        cleaned = cleaned.replace("-", "")
-        if not cleaned.startswith("+"):
-            logger.warning(
-                "Phone number %r lacks '+' prefix — may not match Signal senders", entry
-            )
         result.add(cleaned)
 
     return result
