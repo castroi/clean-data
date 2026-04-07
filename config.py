@@ -48,3 +48,4 @@ class Config:
     MAX_FILE_SIZE_MB: int = int(os.getenv("MAX_FILE_SIZE_MB", "25"))
     PROCESSING_TIMEOUT: int = int(os.getenv("PROCESSING_TIMEOUT", "300"))
     ALLOWED_SENDERS: str = os.getenv("ALLOWED_SENDERS", "")
+    WORD_SESSION_TTL_SECONDS: int = int(os.getenv("WORD_SESSION_TTL_SECONDS", "3600"))
