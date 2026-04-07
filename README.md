@@ -5,7 +5,8 @@ A privacy-first document sanitization tool. Users send PDF or DOCX files via a S
 ## Features
 
 - Receives PDF and DOCX files via Signal messenger
-- Detects and removes PII: names, emails, phone numbers, Israeli IDs (Teudat Zehut), addresses
+- **Automatic PII removal**: Detects and removes names, emails, phone numbers, Israeli IDs (Teudat Zehut), addresses
+- **Custom word removal**: Use `/replace word1, word2, ...` to specify custom words/names/numbers to remove instead
 - Supports English and Hebrew (RTL) documents, including bilingual content
 - Strips all document metadata (author, dates, creator, etc.)
 - Securely deletes all files after processing (overwrite + unlink)
@@ -36,9 +37,11 @@ main.py → SignalBot → CleaningPipeline → PDFCleaner / DOCXCleaner → PIID
 
 | Module | Description |
 |---|---|
-| `signal_bot.py` | Signal bot with rate limiting, sender allowlist, filename sanitization |
+| `signal_bot.py` | Signal bot with `/replace` and `/end` commands, rate limiting, sender allowlist |
+| `word_session_store.py` | Per-sender custom word storage with 1-hour TTL for `/replace` command |
 | `processor/pipeline.py` | Orchestrates cleaning, enforces timeout |
 | `processor/pii_detector.py` | Presidio + heBERT-NER dual-language PII detection |
+| `processor/custom_word_detector.py` | Case-insensitive text matching for user-specified custom words |
 | `processor/pdf_cleaner.py` | PDF text cleaning + metadata stripping |
 | `processor/docx_cleaner.py` | DOCX cleaning (paragraphs, tables, headers/footers) + metadata |
 | `processor/metadata.py` | PDF and DOCX metadata stripping |
@@ -163,10 +166,46 @@ All configuration is done via environment variables or a `.env` file.
 | `MAX_FILE_SIZE_MB` | Maximum accepted file size in MB | `25` |
 | `PROCESSING_TIMEOUT` | Maximum processing time in seconds | `300` |
 | `ALLOWED_SENDERS` | Comma-separated allowlist of Signal UUIDs | (all senders allowed) |
+| `WORD_SESSION_TTL_SECONDS` | TTL for `/replace` custom word sessions | `3600` (1 hour) |
+| `MAX_WORDS_PER_SENDER` | Maximum custom words per `/replace` session | `15` |
+| `MAX_WORD_LENGTH` | Maximum length per custom word | `100` |
+| `MAX_WORD_SESSIONS` | Maximum concurrent `/replace` sessions | `100` |
 
 For strongest PII protection, mount `TEMP_DIR` on a `tmpfs` volume so temporary files never touch disk.
 
-## Dockers Architecture
+## Usage
+
+### Automatic PII Removal (Default)
+
+Send a PDF or DOCX file to the bot. It will automatically detect and remove all PII (names, emails, phone numbers, IDs, addresses) and return the cleaned document.
+
+### Custom Word Removal (`/replace` command)
+
+Specify custom words to remove instead of automatic PII detection:
+
+```
+User: /replace Amit, Joni, David Cohen
+Bot:  3 word(s) added (3 total active).
+      These words will be removed from documents sent in the next hour.
+      Send /end to clear.
+```
+
+Then send documents — all occurrences of those words will be removed (case-insensitive).
+
+**Features:**
+- Words accumulate: send `/replace Amit` then `/replace Joni` and both will be removed
+- Supports multi-word phrases: `/replace David Cohen, רחוב הרצל` (English and Hebrew)
+- Case-insensitive matching: `/replace amit` removes "Amit", "AMIT", "amit"
+- 1-hour expiration: words are automatically cleared after 1 hour of inactivity
+- Per-sender isolation: each user's custom words don't affect others
+
+**Clear custom words:**
+```
+User: /end
+Bot:  Custom words cleared. Back to automatic PII detection.
+```
+
+## Docker Architecture
 
 ```
 ┌─────────────────────────┐       ┌─────────────────────────┐
