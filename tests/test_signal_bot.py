@@ -16,6 +16,18 @@ def config(tmp_path: Path):
         TEMP_DIR=tmp_path / "temp",
         MAX_FILE_SIZE_MB=25,
         PROCESSING_TIMEOUT=300,
+        ALLOWED_SENDERS="",
+    )
+
+
+def _make_config(tmp_path: Path, allowed_senders: str = "") -> Config:
+    return Config(
+        SIGNAL_PHONE_NUMBER="+972501234567",
+        SIGNAL_CLI_URL="http://localhost:8080",
+        TEMP_DIR=tmp_path / "temp",
+        MAX_FILE_SIZE_MB=25,
+        PROCESSING_TIMEOUT=300,
+        ALLOWED_SENDERS=allowed_senders,
     )
 
 
@@ -214,3 +226,50 @@ def test_send_attachment_missing_file(bot: SignalBot, tmp_path: Path):
 
     # Should not raise (caught by exception handler)
     bot._send_attachment("+972509999999", missing_file, "Done.")
+
+
+# --- Allowlist tests ---
+
+
+def test_allowlist_rejects_unauthorized_sender_silently(tmp_path: Path):
+    """Bot with ALLOWED_SENDERS set should silently ignore unauthorized senders."""
+    cfg = _make_config(tmp_path, allowed_senders="+972501234567")
+    with patch("signal_bot.SignalCliRestApi"):
+        b = SignalBot(cfg)
+        b._api = MagicMock()
+
+    b.handle_message(sender="+15550000000", message="hello", attachments=None)
+
+    # No message should be sent back — silent rejection
+    b._api.send_message.assert_not_called()
+
+
+def test_allowlist_allows_authorized_sender(tmp_path: Path):
+    """Bot with ALLOWED_SENDERS set should process messages from authorized senders."""
+    cfg = _make_config(tmp_path, allowed_senders="+972509999999")
+    with patch("signal_bot.SignalCliRestApi"):
+        b = SignalBot(cfg)
+        b._api = MagicMock()
+
+    b.handle_message(sender="+972509999999", message="hello", attachments=None)
+
+    # Authorized sender should get the usage message
+    b._api.send_message.assert_called_once()
+    call_kwargs = b._api.send_message.call_args
+    msg = call_kwargs.kwargs.get("message", "") or call_kwargs[1].get("message", "")
+    if not msg:
+        msg = call_kwargs[0][0] if call_kwargs[0] else ""
+    assert "PDF" in msg or "DOCX" in msg
+
+
+def test_empty_allowlist_allows_all_senders(tmp_path: Path):
+    """Bot with empty ALLOWED_SENDERS should allow any sender."""
+    cfg = _make_config(tmp_path, allowed_senders="")
+    with patch("signal_bot.SignalCliRestApi"):
+        b = SignalBot(cfg)
+        b._api = MagicMock()
+
+    b.handle_message(sender="+15550000000", message="hello", attachments=None)
+
+    # Any sender should get the usage message when no allowlist is configured
+    b._api.send_message.assert_called_once()
