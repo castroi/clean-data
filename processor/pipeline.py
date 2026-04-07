@@ -26,8 +26,14 @@ class CleaningPipeline:
         self._pdf_cleaner = PDFCleaner(self._detector)
         self._docx_cleaner = DOCXCleaner(self._detector)
 
-    def process(self, input_path: Path) -> Path:
+    def process(self, input_path: Path, detector: PIIDetector | None = None) -> Path:
         """Process a document and return the path to the cleaned file.
+
+        Args:
+            input_path: Path to the document to process.
+            detector: Optional detector override. When provided, a temporary
+                cleaner is created using that detector instead of the default
+                PIIDetector. Useful for CustomWordDetector sessions.
 
         Raises ValueError for unsupported file types.
         Raises ProcessingTimeout if processing exceeds the configured limit.
@@ -42,6 +48,13 @@ class CleaningPipeline:
 
         output_path = input_path.parent / f"cleaned_{input_path.name}"
 
+        if detector is not None:
+            pdf_cleaner = PDFCleaner(detector)
+            docx_cleaner = DOCXCleaner(detector)
+        else:
+            pdf_cleaner = self._pdf_cleaner
+            docx_cleaner = self._docx_cleaner
+
         def _timeout_handler(signum, frame):
             raise ProcessingTimeout(
                 f"Processing exceeded {self._config.PROCESSING_TIMEOUT}s timeout"
@@ -53,9 +66,9 @@ class CleaningPipeline:
 
         try:
             if ext == ".pdf":
-                stats = self._pdf_cleaner.clean(input_path, output_path)
+                stats = pdf_cleaner.clean(input_path, output_path)
             else:
-                stats = self._docx_cleaner.clean(input_path, output_path)
+                stats = docx_cleaner.clean(input_path, output_path)
 
             logger.info("Processing complete: %s", stats)
         finally:
