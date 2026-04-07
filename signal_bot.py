@@ -51,7 +51,12 @@ class SignalBot:
         self._allowed_senders: set[str] = parse_allowed_senders(self._config.ALLOWED_SENDERS)
 
         # Per-sender custom word sessions for /replace command
-        self._word_store = WordSessionStore(ttl_seconds=self._config.WORD_SESSION_TTL_SECONDS)
+        self._word_store = WordSessionStore(
+            ttl_seconds=self._config.WORD_SESSION_TTL_SECONDS,
+            max_words=self._config.MAX_WORDS_PER_SENDER,
+            max_word_length=self._config.MAX_WORD_LENGTH,
+            max_sessions=self._config.MAX_WORD_SESSIONS,
+        )
 
     def _is_rate_limited(self, sender: str) -> bool:
         """Check if sender has exceeded the rate limit."""
@@ -130,11 +135,14 @@ class SignalBot:
             if not words:
                 self._send_message(sender, "Usage: /replace word1, word2, word3")
                 return
-            all_words = self._word_store.add_words(sender, words)
-            word_list = ", ".join(all_words)
+            try:
+                all_words = self._word_store.add_words(sender, words)
+            except ValueError as e:
+                self._send_message(sender, str(e))
+                return
             self._send_message(
                 sender,
-                f"Custom words set ({len(all_words)}): {word_list}\n"
+                f"{len(words)} word(s) added ({len(all_words)} total active).\n"
                 f"These words will be removed from documents sent in the next hour.\n"
                 f"Send /end to clear.",
             )

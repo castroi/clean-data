@@ -49,3 +49,6 @@ class Config:
     PROCESSING_TIMEOUT: int = int(os.getenv("PROCESSING_TIMEOUT", "300"))
     ALLOWED_SENDERS: str = os.getenv("ALLOWED_SENDERS", "")
     WORD_SESSION_TTL_SECONDS: int = int(os.getenv("WORD_SESSION_TTL_SECONDS", "3600"))
+    MAX_WORDS_PER_SENDER: int = int(os.getenv("MAX_WORDS_PER_SENDER", "15"))
+    MAX_WORD_LENGTH: int = int(os.getenv("MAX_WORD_LENGTH", "100"))
+    MAX_WORD_SESSIONS: int = int(os.getenv("MAX_WORD_SESSIONS", "100"))

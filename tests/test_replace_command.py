@@ -78,7 +78,7 @@ def test_replace_command_stores_english_words(tmp_path: Path):
     bot.handle_message(sender=SENDER, message="/replace Amit, Joni", attachments=None)
 
     messages = _extract_messages(bot)
-    assert any("Amit" in m and "Joni" in m for m in messages)
+    assert any("2 total active" in m for m in messages)
     assert bot._word_store.has_active_session(SENDER)
     words = bot._word_store.get_words(SENDER)
     assert "Amit" in words
@@ -91,7 +91,7 @@ def test_replace_command_stores_hebrew_words(tmp_path: Path):
     bot.handle_message(sender=SENDER, message="/replace יעקב, יוסף", attachments=None)
 
     messages = _extract_messages(bot)
-    assert any("יעקב" in m or "יוסף" in m for m in messages)
+    assert any("2 total active" in m for m in messages)
     words = bot._word_store.get_words(SENDER)
     assert "יעקב" in words
     assert "יוסף" in words
