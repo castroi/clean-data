@@ -1,7 +1,5 @@
 import logging
 
-import pytest
-
 from config import parse_allowed_senders
 
 
@@ -34,12 +32,8 @@ def test_trailing_and_leading_commas_ignored():
     assert parse_allowed_senders(",+972,,") == {"+972"}
 
 
-def test_dashes_allowed():
-    assert parse_allowed_senders("+1-555-1234") == {"+1-555-1234"}
-
-
-def test_plus_sign_preserved():
-    assert parse_allowed_senders("+972501234567") == {"+972501234567"}
+def test_dashes_stripped_for_e164():
+    assert parse_allowed_senders("+1-555-1234") == {"+15551234"}
 
 
 def test_invalid_characters_skipped_with_warning(caplog):

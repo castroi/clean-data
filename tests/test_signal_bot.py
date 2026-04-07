@@ -1,23 +1,11 @@
 import pytest
 from pathlib import Path
-from unittest.mock import MagicMock, patch, ANY
+from unittest.mock import MagicMock, patch
 
 import fitz
 
 from config import Config
 from signal_bot import SignalBot
-
-
-@pytest.fixture
-def config(tmp_path: Path):
-    return Config(
-        SIGNAL_PHONE_NUMBER="+972501234567",
-        SIGNAL_CLI_URL="http://localhost:8080",
-        TEMP_DIR=tmp_path / "temp",
-        MAX_FILE_SIZE_MB=25,
-        PROCESSING_TIMEOUT=300,
-        ALLOWED_SENDERS="",
-    )
 
 
 def _make_config(tmp_path: Path, allowed_senders: str = "") -> Config:
@@ -29,6 +17,11 @@ def _make_config(tmp_path: Path, allowed_senders: str = "") -> Config:
         PROCESSING_TIMEOUT=300,
         ALLOWED_SENDERS=allowed_senders,
     )
+
+
+@pytest.fixture
+def config(tmp_path: Path) -> Config:
+    return _make_config(tmp_path)
 
 
 @pytest.fixture
@@ -48,15 +41,20 @@ def _make_pdf_bytes(text: str) -> bytes:
     return data
 
 
+def _extract_message(mock_call) -> str:
+    """Extract the 'message' value from a mock send_message call."""
+    msg = mock_call.kwargs.get("message", "") or mock_call[1].get("message", "")
+    if not msg and mock_call[0]:
+        msg = mock_call[0][0]
+    return msg
+
+
 def test_handles_text_message(bot: SignalBot):
     """Text-only message should return usage instructions."""
     bot.handle_message(sender="+972509999999", message="hello", attachments=None)
 
     bot._api.send_message.assert_called_once()
-    call_kwargs = bot._api.send_message.call_args
-    msg = call_kwargs.kwargs.get("message", "") or call_kwargs[1].get("message", "")
-    if not msg:
-        msg = call_kwargs[0][0] if call_kwargs[0] else ""
+    msg = _extract_message(bot._api.send_message.call_args)
     assert "PDF" in msg or "DOCX" in msg
 
 
@@ -66,10 +64,7 @@ def test_handles_unsupported_file(bot: SignalBot):
     bot.handle_message(sender="+972509999999", message="", attachments=[attachment])
 
     bot._api.send_message.assert_called_once()
-    call_args = bot._api.send_message.call_args
-    msg = call_args.kwargs.get("message", "") or call_args[1].get("message", "")
-    if not msg:
-        msg = call_args[0][0] if call_args[0] else ""
+    msg = _extract_message(bot._api.send_message.call_args)
     assert "Unsupported" in msg or "unsupported" in msg
 
 
@@ -82,10 +77,7 @@ def test_handles_oversized_file(bot: SignalBot):
     }
     bot.handle_message(sender="+972509999999", message="", attachments=[attachment])
 
-    call_args = bot._api.send_message.call_args
-    msg = call_args.kwargs.get("message", "") or call_args[1].get("message", "")
-    if not msg:
-        msg = call_args[0][0] if call_args[0] else ""
+    msg = _extract_message(bot._api.send_message.call_args)
     assert "large" in msg.lower() or "maximum" in msg.lower()
 
 
@@ -165,13 +157,7 @@ def test_process_attachment_empty_content_from_api(bot: SignalBot):
     bot.handle_message(sender="+972509999999", message="", attachments=[attachment])
 
     # Find the "empty file" error message
-    calls = bot._api.send_message.call_args_list
-    messages = []
-    for call in calls:
-        msg = call.kwargs.get("message", "") or call[1].get("message", "")
-        if not msg and call[0]:
-            msg = call[0][0]
-        messages.append(msg)
+    messages = [_extract_message(call) for call in bot._api.send_message.call_args_list]
     assert any("empty" in m.lower() for m in messages)
 
 
@@ -182,13 +168,7 @@ def test_process_attachment_api_content_too_large(bot: SignalBot):
     attachment = {"filename": "test.pdf", "size": 100, "id": "abc123"}
     bot.handle_message(sender="+972509999999", message="", attachments=[attachment])
 
-    calls = bot._api.send_message.call_args_list
-    messages = []
-    for call in calls:
-        msg = call.kwargs.get("message", "") or call[1].get("message", "")
-        if not msg and call[0]:
-            msg = call[0][0]
-        messages.append(msg)
+    messages = [_extract_message(call) for call in bot._api.send_message.call_args_list]
     assert any("large" in m.lower() or "maximum" in m.lower() for m in messages)
 
 
@@ -255,11 +235,21 @@ def test_allowlist_allows_authorized_sender(tmp_path: Path):
 
     # Authorized sender should get the usage message
     b._api.send_message.assert_called_once()
-    call_kwargs = b._api.send_message.call_args
-    msg = call_kwargs.kwargs.get("message", "") or call_kwargs[1].get("message", "")
-    if not msg:
-        msg = call_kwargs[0][0] if call_kwargs[0] else ""
+    msg = _extract_message(b._api.send_message.call_args)
     assert "PDF" in msg or "DOCX" in msg
+
+
+def test_allowlist_matches_despite_dashes_in_config(tmp_path: Path):
+    """Config has '+1-555-1234', Signal sends '+15551234' — should match after normalization."""
+    cfg = _make_config(tmp_path, allowed_senders="+1-555-1234")
+    with patch("signal_bot.SignalCliRestApi"):
+        b = SignalBot(cfg)
+        b._api = MagicMock()
+
+    b.handle_message(sender="+15551234", message="hello", attachments=None)
+
+    # Sender should be allowed — usage message sent
+    b._api.send_message.assert_called_once()
 
 
 def test_empty_allowlist_allows_all_senders(tmp_path: Path):

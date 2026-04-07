@@ -35,6 +35,12 @@ def parse_allowed_senders(raw: str) -> set[str]:
         if not _VALID_PHONE_RE.match(cleaned):
             logger.warning("Skipping invalid phone number in ALLOWED_SENDERS: %r", stripped)
             continue
+        # Normalize to E.164: strip dashes so "+1-555-1234" matches "+15551234" from Signal
+        cleaned = cleaned.replace("-", "")
+        if not cleaned.startswith("+"):
+            logger.warning(
+                "Phone number %r lacks '+' prefix — may not match Signal senders", entry
+            )
         result.add(cleaned)
 
     return result
