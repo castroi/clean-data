@@ -1,0 +1,55 @@
+services:
+  signal-cli:
+    image: bbernhard/signal-cli-rest-api:latest
+    restart: unless-stopped
+    environment:
+      - MODE=normal
+    ports:
+      - "8080:8080" # map docker port 8080 to host port 8080.
+    volumes:
+      - "./signal-cli-config:/home/.local/share/signal-cli" # map "signal-cli-config" folder on host system into docker container. the folder contains the password and cryptographic keys when a new number is registered
+    networks:
+      - clean-data-net
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/v1/about"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  clean-data:
+    build: .
+    restart: unless-stopped
+    read_only: true
+    depends_on:
+      signal-cli:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      - SIGNAL_CLI_URL=http://signal-cli:8080
+      - TEMP_DIR=/tmp/clean-data
+    tmpfs:
+      - /tmp/clean-data:size=512M,mode=0700,uid=1000,gid=1000
+      - /tmp:size=64M
+    networks:
+      - clean-data-net
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import os; os.kill(1, 0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 2g
+    cpus: "2.0"
+    pids_limit: 100
+
+volumes:
+  signal-data:
+
+networks:
+  clean-data-net:
+    driver: bridge
