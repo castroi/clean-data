@@ -31,7 +31,6 @@ def test_trailing_and_leading_commas_ignored():
 def test_uppercase_uuid_lowercased():
     assert parse_allowed_senders("42CC8F08-8B0A-4A79-A46D-000000000001") == {"42cc8f08-8b0a-4a79-a46d-000000000001"}
 
-
 def test_invalid_characters_skipped_with_warning(caplog):
     with caplog.at_level(logging.WARNING, logger="config"):
         result = parse_allowed_senders("+abc123")
