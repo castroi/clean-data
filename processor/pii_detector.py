@@ -6,7 +6,6 @@ from presidio_analyzer import (
     AnalyzerEngine,
     PatternRecognizer,
     Pattern,
-    RecognizerResult,
 )
 from presidio_analyzer.nlp_engine import NlpEngineProvider
 from presidio_anonymizer import AnonymizerEngine
@@ -41,10 +40,12 @@ def _build_israeli_phone_recognizer() -> PatternRecognizer:
 
 
 class PIIDetector:
-    """Detects and removes PII using Presidio with English NLP support.
+    """Detects and removes PII using Presidio with English NLP and Israeli regex recognizers.
 
-    Hebrew NER via heBERT is optional — if the model is not downloaded,
-    Hebrew name detection is skipped but pattern-based detection still works.
+    Uses spaCy en_core_web_sm for English NER. Custom pattern recognizers cover
+    Israeli Teudat Zehut (9-digit IDs) and Israeli phone number formats (05X and
+    +972). No NLP model is loaded for Hebrew — Hebrew text still passes through
+    the English analyzer and the regex recognizers.
     """
 
     def __init__(self) -> None:
@@ -59,62 +60,6 @@ class PIIDetector:
         # Register custom Israeli recognizers
         self._analyzer.registry.add_recognizer(_build_israeli_id_recognizer())
         self._analyzer.registry.add_recognizer(_build_israeli_phone_recognizer())
-
-        # Try loading Hebrew NER model
-        self._hebrew_available = False
-        self._hebrew_pipeline = None
-        try:
-            from transformers import pipeline
-
-            self._hebrew_pipeline = pipeline(
-                "ner",
-                model="avichr/heBERT_NER",
-                aggregation_strategy="simple",
-            )
-            self._hebrew_available = True
-            logger.info("Hebrew NER model loaded successfully")
-        except Exception as e:
-            logger.warning("Hebrew NER model not available: %s", e)
-
-    def _detect_language(self, text: str) -> str:
-        """Detect the primary language of the text."""
-        try:
-            from langdetect import detect
-
-            return detect(text)
-        except Exception:
-            return "en"
-
-    def _get_hebrew_entities(self, text: str) -> list[RecognizerResult]:
-        """Run Hebrew NER to find person names and locations."""
-        if not self._hebrew_available or not self._hebrew_pipeline:
-            return []
-
-        results: list[RecognizerResult] = []
-        try:
-            ner_results = self._hebrew_pipeline(text)
-            for entity in ner_results:
-                entity_type = entity.get("entity_group", "")
-                if entity_type in ("PER", "PERSON", "LOC", "LOCATION", "ORG"):
-                    presidio_type = {
-                        "PER": "PERSON",
-                        "PERSON": "PERSON",
-                        "LOC": "LOCATION",
-                        "LOCATION": "LOCATION",
-                        "ORG": "ORGANIZATION",
-                    }.get(entity_type, "PERSON")
-                    results.append(
-                        RecognizerResult(
-                            entity_type=presidio_type,
-                            start=entity["start"],
-                            end=entity["end"],
-                            score=float(entity.get("score", 0.85)),
-                        )
-                    )
-        except Exception as e:
-            logger.warning("Hebrew NER failed: %s", e)
-
-        return results
 
     def detect_entities(self, text: str) -> list[dict[str, Any]]:
         """Detect PII entities in text and return their details."""
@@ -137,12 +82,6 @@ class PIIDetector:
                 "URL",
             ],
         )
-
-        # Add Hebrew NER results if text contains Hebrew
-        lang = self._detect_language(text)
-        if lang == "he":
-            hebrew_entities = self._get_hebrew_entities(text)
-            results.extend(hebrew_entities)
 
         return [
             {
@@ -176,12 +115,6 @@ class PIIDetector:
                 "URL",
             ],
         )
-
-        # Add Hebrew entities
-        lang = self._detect_language(text)
-        if lang == "he":
-            hebrew_entities = self._get_hebrew_entities(text)
-            results.extend(hebrew_entities)
 
         if not results:
             return text

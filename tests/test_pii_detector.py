@@ -55,3 +55,31 @@ def test_handles_empty_string(detector: PIIDetector):
 def test_detect_entities_empty_string(detector: PIIDetector):
     entities = detector.detect_entities("")
     assert entities == []
+
+
+def test_no_transformers_import_at_module_load():
+    """Regression guard: importing pii_detector must not pull in transformers/torch.
+
+    These libraries were removed to strip the Hebrew NLP pipeline. If a future
+    change reintroduces them as a top-level or constructor-time import, this
+    test will fail and force an explicit decision.
+    """
+    import sys
+
+    for mod in list(sys.modules):
+        if mod.startswith(("transformers", "torch", "langdetect")):
+            del sys.modules[mod]
+    if "processor.pii_detector" in sys.modules:
+        del sys.modules["processor.pii_detector"]
+
+    import processor.pii_detector  # noqa: F401
+    from processor.pii_detector import PIIDetector
+
+    PIIDetector()  # Constructor must also not import transformers/torch
+
+    assert "transformers" not in sys.modules, \
+        "transformers must not be imported by pii_detector"
+    assert "torch" not in sys.modules, \
+        "torch must not be imported by pii_detector"
+    assert "langdetect" not in sys.modules, \
+        "langdetect must not be imported by pii_detector"

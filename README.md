@@ -1,13 +1,13 @@
 # Clean-Data
 
-A privacy-first document sanitization tool. Users send PDF or DOCX files via a Signal bot, the system detects and removes all PII using Microsoft Presidio and a local Hebrew NER model, then returns the cleaned document. All files are securely deleted after processing. No data is retained and no external API calls are made.
+A privacy-first document sanitization tool. Users send PDF or DOCX files via a Signal bot, the system detects and removes all PII using Microsoft Presidio with English NLP and Israeli PII pattern recognizers, then returns the cleaned document. All files are securely deleted after processing. No data is retained and no external API calls are made.
 
 ## Features
 
 - Receives PDF and DOCX files via Signal messenger
 - **Automatic PII removal**: Detects and removes names, emails, phone numbers, Israeli IDs (Teudat Zehut), addresses
 - **Custom word removal**: Use `/replace word1, word2, ...` to specify custom words/names/numbers to remove instead
-- Supports English and Hebrew (RTL) documents, including bilingual content
+- English-language document support with Israeli PII pattern detection (Teudat Zehut IDs, 05X/+972 phone numbers)
 - Strips all document metadata (author, dates, creator, etc.)
 - Securely deletes all files after processing (overwrite + unlink)
 - Zero data retention policy
@@ -19,7 +19,6 @@ A privacy-first document sanitization tool. Users send PDF or DOCX files via a S
 |---|---|
 | Python 3.11+ | Runtime |
 | Microsoft Presidio | PII detection (runs locally) |
-| HuggingFace heBERT-NER | Hebrew named entity recognition (runs locally) |
 | spaCy en_core_web_sm | English NLP |
 | PyMuPDF | PDF processing |
 | python-docx | DOCX processing |
@@ -40,7 +39,7 @@ main.py → SignalBot → CleaningPipeline → PDFCleaner / DOCXCleaner → PIID
 | `signal_bot.py` | Signal bot with `/replace` and `/end` commands, rate limiting, sender allowlist |
 | `word_session_store.py` | Per-sender custom word storage with 1-hour TTL for `/replace` command |
 | `processor/pipeline.py` | Orchestrates cleaning, enforces timeout |
-| `processor/pii_detector.py` | Presidio + heBERT-NER dual-language PII detection |
+| `processor/pii_detector.py` | Presidio + spaCy English NER with Israeli regex recognizers |
 | `processor/custom_word_detector.py` | Case-insensitive text matching for user-specified custom words |
 | `processor/pdf_cleaner.py` | PDF text cleaning + metadata stripping |
 | `processor/docx_cleaner.py` | DOCX cleaning (paragraphs, tables, headers/footers) + metadata |
@@ -76,21 +75,11 @@ TMPDIR=~/tmp pip install --no-cache-dir -r requirements.txt
 python3 -m spacy download en_core_web_sm
 ```
 
-### 5. Download the Hebrew NER model (optional)
-
-The model downloads automatically on first use. To download it manually:
-
-```bash
-python3 -c "from transformers import pipeline; pipeline('ner', model='avichr/heBERT-NER')"
-```
-
-Note: this requires approximately 500MB of disk space.
-
-### 6. Configure signal-cli
+### 5. Configure signal-cli
 
 Install and configure the [signal-cli REST API](https://github.com/bbernhard/signal-cli-rest-api) with a registered phone number.
 
-### 7. Configure environment variables
+### 6. Configure environment variables
 
 ```bash
 cp .env.example .env
@@ -98,7 +87,7 @@ cp .env.example .env
 
 Edit `.env` with your values (see Configuration below).
 
-### 8. Run
+### 7. Run
 
 ```bash
 python3 main.py
@@ -212,7 +201,7 @@ Bot:  Custom words cleared. Back to automatic PII detection.
 │  signal-cli container   │       │  clean-data container   │
 │  (REST API on :8080)    │◄──────│  (Python bot + NLP)     │
 │                         │       │  Presidio, spaCy,       │
-│  bbernhard/             │       │  heBERT, PyMuPDF        │
+│  bbernhard/             │       │  PyMuPDF, python-docx   │
 │  signal-cli-rest-api    │       │  custom Dockerfile      │
 └─────────────────────────┘       └─────────────────────────┘
          │                                   │
@@ -226,7 +215,7 @@ Two containers run on an internal Docker bridge network:
 - **signal-cli** uses the official [bbernhard/signal-cli-rest-api](https://github.com/bbernhard/signal-cli-rest-api) image. It handles Signal protocol, message sending/receiving, and attachment storage. Signal credentials are persisted in a named Docker volume.
 - **clean-data** is built from the project's `Dockerfile`. It packages the Python application with all NLP models baked in (no internet needed at runtime). It communicates with signal-cli over the internal network via HTTP REST API.
 
-The signal-cli port is **not exposed to the host** — only the clean-data container can reach it. Temporary files are stored on a `tmpfs` mount, so PII never touches persistent storage. This addresses the secure deletion concern from the [security audit](docs/cybersecurity.md).
+The signal-cli port is **not exposed to the host** — only the clean-data container can reach it. Temporary files are stored on a `tmpfs` mount, so PII never touches persistent storage.
 
 ### Useful Docker Commands
 
@@ -266,8 +255,6 @@ pytest tests/test_signal_bot.py -v
 - Stale temporary files are purged on startup
 - No PII is written to logs — exception details are logged at DEBUG level only
 - End-to-end encrypted messaging via Signal
-
-A full security audit is available at [`docs/cybersecurity.md`](docs/cybersecurity.md).
 
 ## Privacy Principles
 
