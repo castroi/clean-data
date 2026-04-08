@@ -10,7 +10,6 @@ Clean-Data is a privacy-first document sanitization service. It receives PDF/DOC
 
 - **Language:** Python 3.11+
 - **PII Detection:** Microsoft Presidio (analyzer + anonymizer)
-- **Hebrew NER:** HuggingFace `avichr/heBERT-NER` (runs locally, no API calls)
 - **English NER:** spaCy `en_core_web_sm` (falls back from `en_core_web_lg`)
 - **PDF Processing:** PyMuPDF (fitz)
 - **DOCX Processing:** python-docx
@@ -77,7 +76,7 @@ main.py → SignalBot → CleaningPipeline → PDFCleaner / DOCXCleaner → PIID
 
 - **`signal_bot.py`** — Signal bot listener. Receives file attachments, dispatches to pipeline, sends back cleaned files. All error paths must still delete the original file. Includes rate limiting, sender allowlist, filename sanitization, and startup temp file purge.
 - **`processor/pipeline.py`** — Orchestrates cleaning. Routes by file extension, enforces timeout, calls secure cleanup.
-- **`processor/pii_detector.py`** — Wraps Presidio with dual-language support. Uses `langdetect` to pick English (spaCy) or Hebrew (heBERT-NER) model per text block. Includes custom recognizers for Israeli PII (Teudat Zehut, 05X phones, +972 format).
+- **`processor/pii_detector.py`** — Wraps Presidio with English NLP (spaCy `en_core_web_sm`). Includes custom recognizers for Israeli PII (Teudat Zehut, 05X phones, +972 format).
 - **`processor/pdf_cleaner.py`** / **`processor/docx_cleaner.py`** — Format-specific cleaners. Extract text, run through PIIDetector, rebuild document, strip metadata.
 - **`processor/metadata.py`** — Strips all document metadata fields (author, dates, creator, etc.).
 - **`utils/secure_delete.py`** — Overwrites file contents with random bytes then zeros before unlinking. Used for both original and cleaned files after sending.
@@ -87,13 +86,12 @@ main.py → SignalBot → CleaningPipeline → PDFCleaner / DOCXCleaner → PIID
 
 - **All processing is local.** No external API calls. NLP models run on-device (CPU). Documents never leave the machine.
 - **PII removal mode is full deletion** (not redaction or placeholders). Cleaned text has PII stripped entirely.
-- **Hebrew RTL support is required.** Both PDF and DOCX handling must preserve RTL text direction. PII detection must work for Hebrew names, Israeli IDs, and Israeli phone formats.
 - **Zero data retention.** Both original and cleaned files are securely deleted immediately after the cleaned version is sent back via Signal. No temp files should survive a completed or failed processing run.
 - **Signal bot error paths must always clean up.** If processing fails or times out, the original file must still be securely deleted before responding with an error.
 
 ## Security Rules
 
-These were established by a security audit (see `docs/cybersecurity.md`):
+Security rules enforced across the codebase:
 
 - **Never log PII.** Exception messages may contain document content — log exception type at ERROR, detail at DEBUG only.
 - **Sanitize all user-supplied filenames.** Strip path components, validate the resolved path stays inside TEMP_DIR to prevent path traversal.
