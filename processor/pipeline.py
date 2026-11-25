@@ -13,6 +13,15 @@ logger = logging.getLogger(__name__)
 SUPPORTED_EXTENSIONS = {".pdf", ".docx"}
 
 
+def output_path_for(input_path: Path) -> Path:
+    """Where process() writes the cleaned file for ``input_path``.
+
+    Exposed so callers can delete a partially written output after a failure.
+    """
+    input_path = Path(input_path)
+    return input_path.parent / f"cleaned_{input_path.name}"
+
+
 class ProcessingTimeout(Exception):
     """Raised when document processing exceeds the configured timeout."""
 
@@ -46,7 +55,7 @@ class CleaningPipeline:
                 f"Unsupported file type: '{ext}'. Supported: {', '.join(SUPPORTED_EXTENSIONS)}"
             )
 
-        output_path = input_path.parent / f"cleaned_{input_path.name}"
+        output_path = output_path_for(input_path)
 
         if detector is not None:
             pdf_cleaner = PDFCleaner(detector)
