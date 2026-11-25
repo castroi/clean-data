@@ -106,7 +106,7 @@ python3 main.py
 cp .env.example .env
 ```
 
-Edit `.env`: set `SIGNAL_PHONE_NUMBER` to the bot's number and `SIGNAL_BACKEND_URL` to the shared signal-cli on the `signal-net` network. `SIGNAL_API_URL`, `SIGNAL_TOKEN_FILE` and `TEMP_DIR` are set by Docker Compose.
+Edit `.env`: set `SIGNAL_PHONE_NUMBER` to the bot's number, `SIGNAL_BACKEND_URL` to the shared signal-cli on the `signal-net` network, and `ALLOWED_SENDERS` to the Signal UUIDs allowed to use the bot (required; `.env.example` explains how to find a UUID). `SIGNAL_API_URL`, `SIGNAL_TOKEN_FILE`, `TEMP_DIR` and the send limit are fixed in `docker-compose.yml`, which passes only the variables it lists into the containers.
 
 Create the token shared by the bot and its wrapper (never put it in `.env`):
 
@@ -165,7 +165,7 @@ All configuration is done via environment variables or a `.env` file.
 | `TEMP_DIR` | Temporary file directory | `/tmp/clean-data` |
 | `MAX_FILE_SIZE_MB` | Maximum accepted file size in MB | `25` |
 | `PROCESSING_TIMEOUT` | Maximum processing time in seconds | `300` |
-| `ALLOWED_SENDERS` | Comma-separated allowlist of Signal UUIDs (not phone numbers; any invalid entry stops startup) | (all senders allowed, warned at startup) |
+| `ALLOWED_SENDERS` | **Required.** Comma-separated allowlist of Signal UUIDs (not phone numbers). Missing, empty or any invalid entry stops startup | — |
 | `SIGNAL_MAX_SEND_BYTES` | Largest send body the wrapper accepts (its `MAX_BODY_BYTES`); bigger cleaned files are not sent and the user is told | `40000000` |
 | `HEARTBEAT_FILE` | File touched on every frame/pong from the receive stream; used by the Docker healthcheck | (unset) |
 | `WORD_SESSION_TTL_SECONDS` | TTL for `/replace` custom word sessions | `3600` (1 hour) |
@@ -263,7 +263,7 @@ pytest tests/test_signal_bot.py -v
 - All processing is local — documents never leave the machine
 - Files are securely overwritten (random bytes followed by zeros) before deletion
 - Rate limiting: 5 files per 60 seconds per sender
-- Optional sender allowlist restricts access to trusted Signal UUIDs
+- Required sender allowlist of Signal UUIDs: identity is the sender's `sourceUuid` only, unknown senders are dropped silently (no reply, no id logged)
 - Filename sanitization prevents path traversal attacks
 - Stale temporary files are purged on startup
 - No PII is written to logs — exception details are logged at DEBUG level only

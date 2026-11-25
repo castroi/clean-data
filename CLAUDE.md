@@ -52,7 +52,8 @@ The project includes a `Dockerfile` and `docker-compose.yml` for containerized d
 # Copy and configure environment
 cp .env.example .env
 
-# Edit .env: SIGNAL_PHONE_NUMBER and SIGNAL_BACKEND_URL (shared signal-cli on signal-net)
+# Edit .env: SIGNAL_PHONE_NUMBER, SIGNAL_BACKEND_URL (shared signal-cli on signal-net)
+# and ALLOWED_SENDERS (required, Signal UUIDs)
 # Create the wrapper token (Docker secret, never in .env)
 mkdir -p secrets && openssl rand -hex 32 > secrets/signal_token && sudo chgrp 10001 secrets/signal_token && chmod 640 secrets/signal_token
 
@@ -105,10 +106,10 @@ Security rules enforced across the codebase:
 - **Sanitize all user-supplied filenames.** Strip path components, validate the resolved path stays inside TEMP_DIR to prevent path traversal.
 - **Validate actual content size**, not just metadata `size` field from Signal API.
 - **Use `secrets.token_hex()`** for temp filenames, never predictable values like `time.time()`.
-- **Rate limit per sender** (5 files / 60 seconds, 20 messages / 60 seconds). Configurable allowlist via `ALLOWED_SENDERS` (UUIDs; fails closed on invalid entries; sender ids are never logged).
+- **Rate limit per sender** (5 files / 60 seconds, 20 messages / 60 seconds). **Required** allowlist via `ALLOWED_SENDERS` (Signal UUIDs, as in ha-signal-remote): missing, empty or any invalid entry stops startup. Identity is the `sourceUuid` only (no phone-number fallback); the allowlist is checked first; unknown senders are dropped silently and only a rate-limited count is logged, never an id or message.
 - **Purge stale temp files on startup** in case previous process was killed.
 - **Known limitations** (documented in audit): secure delete is not effective on CoW/SSD filesystems — recommend mounting TEMP_DIR on tmpfs. PDF/DOCX cleaners don't yet cover annotations, form fields, footnotes, tracked changes, or embedded files.
 
 ## Configuration
 
-All config via `.env` (see `.env.example`). Key vars: `SIGNAL_PHONE_NUMBER`, `SIGNAL_API_URL` (the wrapper), `SIGNAL_TOKEN_FILE` / `SIGNAL_TOKEN`, `SIGNAL_BACKEND_URL` (compose, for the wrapper), `TEMP_DIR`, `MAX_FILE_SIZE_MB`, `PROCESSING_TIMEOUT`, `ALLOWED_SENDERS` (optional, comma-separated Signal UUIDs — not phone numbers; any invalid entry stops startup), `SIGNAL_MAX_SEND_BYTES` (= the wrapper's `MAX_BODY_BYTES`), `HEARTBEAT_FILE` (healthcheck).
+All config via `.env` (see `.env.example`). Under Docker, `docker-compose.yml` passes only an explicit list of variables (no `env_file`); required ones use `${VAR:?}` so `docker compose up` fails fast. Key vars: `SIGNAL_PHONE_NUMBER`, `SIGNAL_API_URL` (the wrapper), `SIGNAL_TOKEN_FILE` / `SIGNAL_TOKEN`, `SIGNAL_BACKEND_URL` (compose, for the wrapper), `TEMP_DIR`, `MAX_FILE_SIZE_MB`, `PROCESSING_TIMEOUT`, `ALLOWED_SENDERS` (**required**, comma-separated Signal UUIDs — not phone numbers; missing or invalid stops startup), `SIGNAL_MAX_SEND_BYTES` (= the wrapper's `MAX_BODY_BYTES`), `HEARTBEAT_FILE` (healthcheck).
