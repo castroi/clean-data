@@ -259,3 +259,22 @@ def test_text_flood_is_capped(tmp_path):
 def test_missing_or_invalid_allowlist_stops_startup(tmp_path, allowed):
     with pytest.raises(ValueError):
         _bot(tmp_path, allowed=allowed)
+
+
+def test_reply_goes_to_sender_uuid(tmp_path):
+    bot = _bot(tmp_path)
+    bot.on_receive(_frame({"message": "", "attachments": [_att()]}, sourceNumber="+972501234567"))
+    recipients = {tuple(c.kwargs["recipients"]) for c in bot._api.send_message.call_args_list}
+    assert recipients == {(SENDER,)}
+
+
+@pytest.mark.parametrize("near_miss", [
+    SENDER[:-1] + "2",       # one character different
+    SENDER + "0",            # longer
+    SENDER[:-1],             # shorter
+    " " + SENDER,            # whitespace is not trimmed on the sender side
+])
+def test_only_exact_uuid_matches(tmp_path, near_miss):
+    bot = _bot(tmp_path)
+    bot.on_receive(_frame({"message": "hi"}, sender=near_miss))
+    bot._api.send_message.assert_not_called()
