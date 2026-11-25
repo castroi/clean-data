@@ -17,26 +17,35 @@ _VALID_UUID_RE = re.compile(
 
 
 def parse_allowed_senders(raw: str) -> set[str]:
-    """Parse a comma-separated string of Signal UUIDs into a set.
+    """Parse a comma-separated string of Signal UUIDs (ACIs) into a set.
 
-    Each entry is stripped of surrounding whitespace and lowercased.
-    Entries that are not valid UUIDs are logged as a warning and skipped.
-    Returns an empty set for empty/whitespace input.
+    Each entry is stripped of surrounding whitespace and lowercased. Returns an
+    empty set for empty/whitespace input, which means "allow every sender".
+
+    Fails closed: if ANY entry is not a valid UUID (e.g. a phone number), raise
+    instead of skipping it. Skipping could leave the set empty and silently open
+    the bot to everyone. The rejected values are never logged (they are PII).
     """
     if not raw or not raw.strip():
         return set()
 
     result: set[str] = set()
+    invalid = 0
     for entry in raw.split(","):
         stripped = entry.strip()
         if not stripped:
             continue
         cleaned = stripped.lower()
         if not _VALID_UUID_RE.match(cleaned):
-            logger.warning("Skipping invalid UUID in ALLOWED_SENDERS: %r", stripped)
+            invalid += 1
             continue
         result.add(cleaned)
 
+    if invalid:
+        raise ValueError(
+            f"ALLOWED_SENDERS has {invalid} invalid entr{'y' if invalid == 1 else 'ies'}: "
+            "use Signal UUIDs (sourceUuid), not phone numbers"
+        )
     return result
 
 
@@ -53,6 +62,12 @@ class Config:
     MAX_FILE_SIZE_MB: int = int(os.getenv("MAX_FILE_SIZE_MB", "25"))
     PROCESSING_TIMEOUT: int = int(os.getenv("PROCESSING_TIMEOUT", "300"))
     ALLOWED_SENDERS: str = os.getenv("ALLOWED_SENDERS", "")
+    # Largest /v2/send body the wrapper accepts (its MAX_BODY_BYTES). A cleaned
+    # file whose base64 would exceed it is not sent; the user is told instead.
+    SIGNAL_MAX_SEND_BYTES: int = int(os.getenv("SIGNAL_MAX_SEND_BYTES", "40000000"))
+    # Touched on every frame/pong from the receive stream; the Docker
+    # healthcheck checks its age. Empty disables it.
+    HEARTBEAT_FILE: str = os.getenv("HEARTBEAT_FILE", "")
     WORD_SESSION_TTL_SECONDS: int = int(os.getenv("WORD_SESSION_TTL_SECONDS", "3600"))
     MAX_WORDS_PER_SENDER: int = int(os.getenv("MAX_WORDS_PER_SENDER", "15"))
     MAX_WORD_LENGTH: int = int(os.getenv("MAX_WORD_LENGTH", "100"))
