@@ -21,7 +21,9 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-HTTP_TIMEOUT_SECONDS = 60
+# Must outlast the wrapper's own deadline for a file send (UPSTREAM_TIMEOUT_SEC=120
+# in docker-compose.yml), or the bot gives up on a send the wrapper still completes.
+HTTP_TIMEOUT_SECONDS = 150
 RECONNECT_MIN_SECONDS = 1
 RECONNECT_MAX_SECONDS = 30
 

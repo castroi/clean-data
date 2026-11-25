@@ -19,7 +19,9 @@ secrets:
 
 services:
   wrapper-clean-data:
-    image: ghcr.io/castroi/signal-wrapper:latest      # pin by digest in production
+    # Pinned: signal-wrapper main @ edb82b3 (castroi/signal-wrapper#14, ALLOW_ATTACHMENTS),
+    # linux/arm64 (Raspberry Pi). Bump tag + digest deliberately on wrapper updates.
+    image: ghcr.io/castroi/signal-wrapper:sha-edb82b32e98752aeec0bd2997fdf1c9cb6cae1c4@sha256:1c49d94ec8464c2ad47e10523a44fad55a19692bfebe113fa70d5b8b1c949114
     restart: unless-stopped
     init: true
     environment:
@@ -35,7 +37,7 @@ services:
       # cleaned file that grew. Raise together with MAX_FILE_SIZE_MB.
       - MAX_BODY_BYTES=40000000
       - REQUEST_READ_TIMEOUT_SEC=30
-      - UPSTREAM_TIMEOUT_SEC=120
+      - UPSTREAM_TIMEOUT_SEC=120   # keep below signal_client.HTTP_TIMEOUT_SECONDS (150)
       - MAX_LARGE_SENDS=1          # one file send at a time (the bot is sequential)
       - GOMEMLIMIT=160MiB          # keep Go's heap under mem_limit
     secrets: [signal_token]
@@ -43,7 +45,7 @@ services:
     user: "65532:65532"
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
-    mem_limit: 192m   # ~3 x MAX_BODY_BYTES x MAX_LARGE_SENDS + 32m (default 32m is text-only)
+    mem_limit: 192m   # needs ~2 x MAX_BODY_BYTES x MAX_LARGE_SENDS + 32m = ~112m (default 32m is text-only)
     networks: [signal-net, cleandatanet]
     healthcheck:
       test: ["CMD", "/signal-wrapper", "healthcheck"]
