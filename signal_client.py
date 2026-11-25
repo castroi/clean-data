@@ -93,8 +93,22 @@ class _WSConnection:
         self._ws.close()
 
     def abort(self) -> None:
-        """Close the socket at once, from another thread, without a close
-        handshake. Unblocks a read() in progress on the reader thread."""
+        """Stop the connection at once, from another thread, without a close
+        handshake. Unblocks a read() in progress on the reader thread.
+
+        websocket-client's abort() does socket.shutdown(SHUT_RDWR): a blocked
+        recv returns at once and the peer sees EOF, so signal-cli stops sending.
+        Its shutdown() only closes the file descriptor, which does NOT wake a
+        blocked recv and leaves the TCP connection open, so frames could still
+        arrive and be lost. The reader closes the socket itself afterwards.
+        """
+        ws_abort = getattr(self._ws, "abort", None)
+        if ws_abort is not None:
+            try:
+                ws_abort()
+                return
+            except OSError:
+                pass  # e.g. already disconnected; fall through to closing it
         shutdown_socket = getattr(self._ws, "shutdown", None)
         if shutdown_socket is not None:
             shutdown_socket()
