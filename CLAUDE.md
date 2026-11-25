@@ -42,6 +42,8 @@ pytest tests/test_pii_detector.py::test_removes_english_name -v
 python3 main.py
 ```
 
+CI (`.github/workflows/ci.yml`, job `check`, required by the `main` ruleset) installs `requirements.txt` + the spaCy model on Python 3.11, runs `pip-audit`, runs every test file separately, and checks `docker compose config`. Actions are pinned to commit SHAs; Dependabot (`.github/dependabot.yml`) proposes pip and action updates weekly after a 7-day cooldown.
+
 Note: The full test suite loads multiple PIIDetector instances (NLP models) which can exceed 1GB RAM. Run test files individually if memory-constrained.
 
 ## Docker Deployment
