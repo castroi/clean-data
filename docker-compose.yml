@@ -36,12 +36,14 @@ services:
       - MAX_BODY_BYTES=40000000
       - REQUEST_READ_TIMEOUT_SEC=30
       - UPSTREAM_TIMEOUT_SEC=120
+      - MAX_LARGE_SENDS=1          # one file send at a time (the bot is sequential)
+      - GOMEMLIMIT=160MiB          # keep Go's heap under mem_limit
     secrets: [signal_token]
     read_only: true
     user: "65532:65532"
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
-    mem_limit: 192m   # holds a full send body in memory (default 32m is text-only)
+    mem_limit: 192m   # ~3 x MAX_BODY_BYTES x MAX_LARGE_SENDS + 32m (default 32m is text-only)
     networks: [signal-net, cleandatanet]
     healthcheck:
       test: ["CMD", "/signal-wrapper", "healthcheck"]
