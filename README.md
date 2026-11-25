@@ -111,7 +111,7 @@ Edit `.env`: set `SIGNAL_PHONE_NUMBER` to the bot's number and `SIGNAL_BACKEND_U
 Create the token shared by the bot and its wrapper (never put it in `.env`):
 
 ```bash
-mkdir -p secrets && openssl rand -hex 32 > secrets/signal_token && chmod 600 secrets/signal_token
+mkdir -p secrets && openssl rand -hex 32 > secrets/signal_token && sudo chgrp 10001 secrets/signal_token && chmod 640 secrets/signal_token
 ```
 
 ### 2. Register your Signal number (one-time)
@@ -165,7 +165,9 @@ All configuration is done via environment variables or a `.env` file.
 | `TEMP_DIR` | Temporary file directory | `/tmp/clean-data` |
 | `MAX_FILE_SIZE_MB` | Maximum accepted file size in MB | `25` |
 | `PROCESSING_TIMEOUT` | Maximum processing time in seconds | `300` |
-| `ALLOWED_SENDERS` | Comma-separated allowlist of Signal UUIDs | (all senders allowed) |
+| `ALLOWED_SENDERS` | Comma-separated allowlist of Signal UUIDs (not phone numbers; any invalid entry stops startup) | (all senders allowed, warned at startup) |
+| `SIGNAL_MAX_SEND_BYTES` | Largest send body the wrapper accepts (its `MAX_BODY_BYTES`); bigger cleaned files are not sent and the user is told | `40000000` |
+| `HEARTBEAT_FILE` | File touched on every frame/pong from the receive stream; used by the Docker healthcheck | (unset) |
 | `WORD_SESSION_TTL_SECONDS` | TTL for `/replace` custom word sessions | `3600` (1 hour) |
 | `MAX_WORDS_PER_SENDER` | Maximum custom words per `/replace` session | `15` |
 | `MAX_WORD_LENGTH` | Maximum length per custom word | `100` |
@@ -269,7 +271,7 @@ pytest tests/test_signal_bot.py -v
 
 ## Privacy Principles
 
-- **Zero data retention** — all files are deleted immediately after processing, including the copy signal-cli keeps of each received attachment
+- **Zero data retention** — all files are deleted immediately after processing, including the copy signal-cli keeps of each received attachment (deleted right after download, and every other attachment in a message — previews, quote thumbnails, edits, stories — when the message is done). Caveats: a hard crash or OOM kill between download and delete can leave the original in signal-cli, and files sent to the shared signal-cli's other (text-only) bots are not deleted by anyone (castroi/signal-wrapper#23).
 - **No external API calls** — all NLP models run locally on CPU
 - **No PII in logs** — exception details are logged at DEBUG level only
 - **End-to-end encrypted** — all communication via Signal

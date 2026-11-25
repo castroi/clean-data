@@ -8,7 +8,10 @@
 #   - the shared signal-cli (bbernhard/signal-cli-rest-api, MODE=json-rpc) is
 #     running on the external `signal-net` network with this bot's number
 #     registered on it
-#   - mkdir -p secrets && openssl rand -hex 32 > secrets/signal_token && chmod 600 secrets/signal_token
+#   - the token file, readable by both containers through a shared group (the
+#     wrapper runs as uid 65532, clean-data as uid 1000; both get gid 10001):
+#       mkdir -p secrets && openssl rand -hex 32 > secrets/signal_token
+#       sudo chgrp 10001 secrets/signal_token && chmod 640 secrets/signal_token
 
 networks:
   signal-net: { external: true, name: signal-net }   # the ONE signal-cli's network
@@ -35,12 +38,13 @@ services:
       - MAX_ATTACHMENTS=1
       # Fits a 25 MB file as base64 (~4/3) plus JSON, with headroom for a
       # cleaned file that grew. Raise together with MAX_FILE_SIZE_MB.
-      - MAX_BODY_BYTES=40000000
+      - MAX_BODY_BYTES=40000000   # keep == SIGNAL_MAX_SEND_BYTES of clean-data
       - REQUEST_READ_TIMEOUT_SEC=30
       - UPSTREAM_TIMEOUT_SEC=120   # keep below signal_client.HTTP_TIMEOUT_SECONDS (150)
       - MAX_LARGE_SENDS=1          # one file send at a time (the bot is sequential)
       - GOMEMLIMIT=160MiB          # keep Go's heap under mem_limit
     secrets: [signal_token]
+    group_add: ["10001"]   # can read secrets/signal_token (mode 640, group 10001)
     read_only: true
     user: "65532:65532"
     cap_drop: [ALL]
@@ -56,6 +60,8 @@ services:
   clean-data:
     build: .
     restart: unless-stopped
+    init: true               # forwards docker stop's SIGTERM to the bot
+    stop_grace_period: 30s   # time to delete the in-flight file from signal-cli
     read_only: true
     depends_on:
       wrapper-clean-data:
@@ -66,16 +72,22 @@ services:
       - SIGNAL_API_URL=http://wrapper-clean-data:8080
       - SIGNAL_TOKEN_FILE=/run/secrets/signal_token
       - TEMP_DIR=/tmp/clean-data
+      - SIGNAL_MAX_SEND_BYTES=40000000   # == the wrapper's MAX_BODY_BYTES
+      - HEARTBEAT_FILE=/tmp/heartbeat    # touched on every frame/pong from the wrapper
     secrets: [signal_token]
+    group_add: ["10001"]
     tmpfs:
       - /tmp/clean-data:size=512M,mode=0700,uid=1000,gid=1000
       - /tmp:size=64M
     networks: [cleandatanet]   # only its wrapper; never signal-net
     healthcheck:
-      test: ["CMD", "python3", "-c", "import os; os.kill(1, 0)"]
+      # Healthy only while the receive stream is alive: the reader pings every
+      # 30 s and touches the heartbeat on each frame or pong.
+      test: ["CMD", "python3", "-c", "import os,sys,time; sys.exit(0 if time.time() - os.path.getmtime('/tmp/heartbeat') < 120 else 1)"]
       interval: 30s
       timeout: 5s
       retries: 3
+      start_period: 60s
     cap_drop:
       - ALL
     security_opt:
