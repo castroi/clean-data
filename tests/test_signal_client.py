@@ -1,10 +1,11 @@
 import base64
 import json
+import time
 from unittest.mock import MagicMock
 
 import pytest
 
-from signal_client import SignalClient, parse_frame, to_data_uri
+from signal_client import MAX_MISSED_PINGS, SignalClient, WSTimeout, parse_frame, to_data_uri
 
 TOKEN = "t" * 32
 NUMBER = "+15550000001"
@@ -100,6 +101,38 @@ def test_delete_attachment():
     session.delete.return_value.raise_for_status.assert_called_once()
 
 
+def _resp(status):
+    r = MagicMock()
+    r.status_code = status
+    if status >= 400:
+        r.raise_for_status.side_effect = RuntimeError(str(status))
+    return r
+
+
+def test_delete_retries_then_succeeds():
+    session = MagicMock()
+    session.delete.side_effect = [_resp(502), _resp(204)]
+    sleeps = []
+    _client(session, sleep=sleeps.append).delete_attachment("abc")
+    assert session.delete.call_count == 2
+    assert sleeps == [1]
+
+
+def test_delete_404_counts_as_gone():
+    session = MagicMock()
+    session.delete.return_value = _resp(404)
+    _client(session).delete_attachment("abc")
+    assert session.delete.call_count == 1
+
+
+def test_delete_gives_up_after_attempts():
+    session = MagicMock()
+    session.delete.return_value = _resp(503)
+    with pytest.raises(RuntimeError):
+        _client(session).delete_attachment("abc")
+    assert session.delete.call_count == 3
+
+
 # --- receive ---
 
 
@@ -119,43 +152,104 @@ def test_parse_frame_forms():
 
 
 class _FakeWS:
+    """Stands in for _WSConnection: read() returns frames, None (pong),
+    raises WSTimeout (idle) or ConnectionError (closed)."""
+
     def __init__(self, frames):
         self._frames = list(frames)
+        self.pings = 0
         self.closed = False
 
-    def recv(self):
+    def read(self):
         if not self._frames:
-            return ""  # server closed
+            raise ConnectionError("closed")
         f = self._frames.pop(0)
-        if isinstance(f, Exception):
+        if isinstance(f, BaseException) or (isinstance(f, type) and issubclass(f, BaseException)):
             raise f
         return f
 
+    def ping(self):
+        self.pings += 1
 
-def test_receive_forever_dispatches_and_reconnects():
+    def close(self):
+        self.closed = True
+
+
+def _run(client, handler, until, timeout=5.0):
+    """Run receive_forever until ``until()`` is true (or fail after timeout)."""
+    deadline = time.time() + timeout
+    client.receive_forever(handler, should_stop=lambda: until() or time.time() > deadline)
+    assert until(), "condition not reached before timeout"
+
+
+def test_receive_dispatches_both_frame_forms_and_reconnects():
     env = {"sourceUuid": SENDER, "dataMessage": {"message": "hi"}}
     sockets = [
-        _FakeWS([json.dumps({"envelope": env}), "garbage"]),
+        _FakeWS([json.dumps({"envelope": env}), "garbage", None]),
         _FakeWS([json.dumps({"method": "receive", "params": {"envelope": env}})]),
     ]
     connects = []
 
     def ws_connect(url, headers):
         connects.append((url, headers))
-        return sockets[len(connects) - 1]
+        return sockets[min(len(connects) - 1, 1)]
 
     got = []
-    sleeps = []
-    client = _client(ws_connect=ws_connect, sleep=sleeps.append)
-    client.receive_forever(got.append, should_stop=lambda: len(connects) >= 2 and not sockets[1]._frames)
-
+    _run(_client(ws_connect=ws_connect), got.append, lambda: len(got) >= 2)
     assert [m["envelope"] for m in got] == [env, env]
     assert connects[0] == ("ws://wrapper-clean-data:8080/v1/receive/%2B15550000001",
                            [f"Authorization: Bearer {TOKEN}"])
-    assert sleeps == [1]
+    assert len(connects) >= 2
 
 
-def test_receive_forever_backoff_caps_and_survives_handler_errors():
+def test_receive_pings_when_idle_and_reconnects_when_unanswered():
+    socks = []
+
+    def ws_connect(url, headers):
+        ws = _FakeWS([WSTimeout] * (MAX_MISSED_PINGS + 1))
+        socks.append(ws)
+        return ws
+
+    _run(_client(ws_connect=ws_connect), lambda m: None, lambda: len(socks) >= 2)
+    assert socks[0].pings == MAX_MISSED_PINGS
+    assert socks[0].closed
+
+
+def test_receive_pong_resets_missed_pings():
+    env = {"sourceUuid": SENDER, "dataMessage": {"message": "x"}}
+    frames = [WSTimeout, None, WSTimeout, None, WSTimeout, None, json.dumps({"envelope": env})]
+    ws = _FakeWS(frames)
+    got = []
+    _run(_client(ws_connect=lambda u, h: ws), got.append, lambda: len(got) >= 1)
+    assert ws.pings == 3  # never exceeded MAX_MISSED_PINGS in a row
+
+
+def test_receive_keeps_reading_while_handler_is_slow():
+    """The reader thread keeps answering/reading while a message is processed."""
+    env = {"sourceUuid": SENDER, "dataMessage": {"message": "x"}}
+    ws = _FakeWS([json.dumps({"envelope": env})] + [None] * 50 + [json.dumps({"envelope": env})])
+    got = []
+
+    def slow(m):
+        got.append(m)
+        if len(got) == 1:
+            deadline = time.time() + 2
+            while ws._frames and time.time() < deadline:
+                time.sleep(0.01)  # handler busy; reader must drain meanwhile
+
+    _run(_client(ws_connect=lambda u, h: ws), slow, lambda: len(got) >= 2)
+    assert not ws._frames  # everything was read during the slow handler
+
+
+def test_receive_heartbeat_touched(tmp_path):
+    hb = tmp_path / "hb"
+    ws = _FakeWS([None])
+    client = SignalClient("http://w:8080", NUMBER, TOKEN, session=MagicMock(),
+                          ws_connect=lambda u, h: ws, sleep=lambda s: None, heartbeat_path=hb)
+    _run(client, lambda m: None, hb.exists)
+
+
+def test_receive_backoff_caps_and_survives_handler_errors():
     attempts = []
 
     def ws_connect(url, headers):
@@ -163,12 +257,8 @@ def test_receive_forever_backoff_caps_and_survives_handler_errors():
         raise ConnectionRefusedError()
 
     sleeps = []
-    client = _client(ws_connect=ws_connect, sleep=sleeps.append)
-    client.receive_forever(lambda m: None, should_stop=lambda: len(attempts) >= 7)
-    assert sleeps == [1, 2, 4, 8, 16, 30]
-
-    def boom(_m):
-        raise ValueError("document text")
+    _run(_client(ws_connect=ws_connect, sleep=sleeps.append), lambda m: None, lambda: len(attempts) >= 7)
+    assert sleeps[:6] == [1, 2, 4, 8, 16, 30]
 
     env = {"sourceUuid": SENDER, "dataMessage": {"message": "x"}}
     ws = _FakeWS([json.dumps({"envelope": env}), json.dumps({"envelope": env})])
@@ -176,7 +266,6 @@ def test_receive_forever_backoff_caps_and_survives_handler_errors():
 
     def handler(m):
         calls.append(m)
-        boom(m)
+        raise ValueError("document text")
 
-    _client(ws_connect=lambda u, h: ws).receive_forever(handler, should_stop=lambda: len(calls) >= 2)
-    assert len(calls) == 2
+    _run(_client(ws_connect=lambda u, h: ws), handler, lambda: len(calls) >= 2)

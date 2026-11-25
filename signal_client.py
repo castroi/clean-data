@@ -12,8 +12,11 @@ client unit-tests without a live server.
 import base64
 import json
 import logging
+import queue
+import threading
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlsplit, urlunsplit
 
@@ -26,6 +29,14 @@ logger = logging.getLogger(__name__)
 HTTP_TIMEOUT_SECONDS = 150
 RECONNECT_MIN_SECONDS = 1
 RECONNECT_MAX_SECONDS = 30
+# Keepalive on the receive WebSocket: ping after this many idle seconds, and
+# reconnect if nothing (not even a pong) arrives for MAX_MISSED_PINGS pings.
+PING_INTERVAL_SECONDS = 30
+MAX_MISSED_PINGS = 2
+# Frames waiting for the (slow, sequential) document processor. Frames are
+# small (ids, never file contents); when full, the reader waits.
+RECEIVE_QUEUE_SIZE = 1000
+DELETE_ATTEMPTS = 3
 
 _MIME_BY_EXT = {
     ".pdf": "application/pdf",
@@ -33,11 +44,48 @@ _MIME_BY_EXT = {
 }
 
 
-def _default_ws_connect(url: str, headers: list[str]):
-    # Imported lazily so unit tests don't need the package installed.
-    import websocket
+class WSTimeout(Exception):
+    """No frame arrived within the read timeout (connection may still be fine)."""
 
-    return websocket.create_connection(url, header=headers)
+
+class _WSConnection:
+    """Adapter over websocket-client exposing the small surface the client uses.
+
+    read() returns the next text frame, returns None for control frames (pong)
+    and raises WSTimeout when idle or ConnectionError when the stream closed.
+    websocket-client answers the server's pings itself while reading.
+    """
+
+    def __init__(self, url: str, headers: list[str], timeout: float) -> None:
+        # Imported lazily so unit tests don't need the package installed.
+        import websocket
+
+        self._websocket = websocket
+        self._ws = websocket.create_connection(url, header=headers, timeout=timeout)
+
+    def read(self) -> str | None:
+        ws = self._websocket
+        try:
+            opcode, frame = self._ws.recv_data_frame(True)
+        except ws.WebSocketTimeoutException as e:
+            raise WSTimeout() from e
+        except ws.WebSocketConnectionClosedException as e:
+            raise ConnectionError("receive stream closed") from e
+        if opcode == ws.ABNF.OPCODE_CLOSE:
+            raise ConnectionError("receive stream closed")
+        if opcode in (ws.ABNF.OPCODE_TEXT, ws.ABNF.OPCODE_BINARY):
+            return frame.data.decode("utf-8", "replace") if isinstance(frame.data, bytes) else frame.data
+        return None  # ping/pong/continuation handled by the library
+
+    def ping(self) -> None:
+        self._ws.ping()
+
+    def close(self) -> None:
+        self._ws.close()
+
+
+def _default_ws_connect(url: str, headers: list[str]) -> _WSConnection:
+    return _WSConnection(url, headers, timeout=PING_INTERVAL_SECONDS)
 
 
 def to_data_uri(filename: str, content: bytes) -> str:
@@ -76,6 +124,7 @@ class SignalClient:
         session: Any = None,
         ws_connect: Callable[[str, list[str]], Any] | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        heartbeat_path: Path | None = None,
     ) -> None:
         self._base = base_url.rstrip("/")
         self._number = number
@@ -83,6 +132,7 @@ class SignalClient:
         self._session = session or requests.Session()
         self._ws_connect = ws_connect or _default_ws_connect
         self._sleep = sleep
+        self._heartbeat_path = heartbeat_path
 
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self._token}"} if self._token else {}
@@ -129,13 +179,23 @@ class SignalClient:
             resp.close()
 
     def delete_attachment(self, attachment_id: str) -> None:
-        """Remove a received attachment from signal-cli storage."""
-        resp = self._session.delete(
-            f"{self._base}/v1/attachments/{quote(attachment_id, safe='')}",
-            headers=self._headers(),
-            timeout=HTTP_TIMEOUT_SECONDS,
-        )
-        resp.raise_for_status()
+        """Remove a received attachment from signal-cli storage.
+
+        Retries transient failures. A 404 counts as success (already gone).
+        Raises after DELETE_ATTEMPTS failed attempts.
+        """
+        url = f"{self._base}/v1/attachments/{quote(attachment_id, safe='')}"
+        for attempt in range(1, DELETE_ATTEMPTS + 1):
+            try:
+                resp = self._session.delete(url, headers=self._headers(), timeout=HTTP_TIMEOUT_SECONDS)
+                if resp.status_code == 404:
+                    return
+                resp.raise_for_status()
+                return
+            except Exception:
+                if attempt == DELETE_ATTEMPTS:
+                    raise
+                self._sleep(attempt)
 
     def receive_url(self) -> str:
         parts = urlsplit(self._base)
@@ -143,16 +203,18 @@ class SignalClient:
         path = f"{parts.path}/v1/receive/{quote(self._number, safe='')}"
         return urlunsplit((scheme, parts.netloc, path, "", ""))
 
-    def receive_forever(
-        self,
-        on_message: Callable[[dict], None],
-        should_stop: Callable[[], bool] = lambda: False,
-    ) -> None:
-        """Hold the receive WebSocket open and hand each envelope to ``on_message``.
+    def _beat(self) -> None:
+        if self._heartbeat_path is not None:
+            try:
+                self._heartbeat_path.touch()
+            except OSError:
+                pass
 
-        Reconnects with capped exponential backoff. ``on_message`` errors are
-        logged by type only (they may carry document content) and never stop
-        the loop.
+    def _read_loop(self, frames: "queue.Queue[dict]", should_stop: Callable[[], bool]) -> None:
+        """Reader thread: keep the WebSocket open and queue every envelope.
+
+        Runs independently of message processing, so pings are answered and the
+        stream stays connected while a document is being cleaned.
         """
         delay = RECONNECT_MIN_SECONDS
         headers = [f"Authorization: Bearer {self._token}"] if self._token else []
@@ -161,18 +223,25 @@ class SignalClient:
             try:
                 ws = self._ws_connect(self.receive_url(), headers)
                 logger.info("Receive stream connected")
+                self._beat()
                 delay = RECONNECT_MIN_SECONDS
+                missed = 0
                 while not should_stop():
-                    raw = ws.recv()
-                    if raw in (None, "", b""):
-                        raise ConnectionError("receive stream closed")
-                    msg = parse_frame(raw)
-                    if msg is None:
-                        continue
                     try:
-                        on_message(msg)
-                    except Exception as e:
-                        logger.error("Message handler failed (type: %s)", type(e).__name__)
+                        raw = ws.read()
+                    except WSTimeout:
+                        missed += 1
+                        if missed > MAX_MISSED_PINGS:
+                            raise ConnectionError("receive stream unresponsive")
+                        ws.ping()
+                        continue
+                    missed = 0
+                    self._beat()
+                    if raw is None:
+                        continue
+                    msg = parse_frame(raw)
+                    if msg is not None:
+                        frames.put(msg)
             except Exception as e:
                 logger.warning("Receive stream error (type: %s); reconnecting in %ss",
                                type(e).__name__, delay)
@@ -187,3 +256,32 @@ class SignalClient:
                         ws.close()
                     except Exception:
                         pass
+
+    def receive_forever(
+        self,
+        on_message: Callable[[dict], None],
+        should_stop: Callable[[], bool] = lambda: False,
+    ) -> None:
+        """Receive envelopes on a reader thread; call ``on_message`` on this thread.
+
+        Processing stays on the calling (main) thread because the pipeline's
+        timeout uses SIGALRM and shutdown uses SIGTERM, which Python delivers
+        only to the main thread. ``on_message`` errors are logged by type only
+        (they may carry document content) and never stop the loop.
+        """
+        frames: queue.Queue[dict] = queue.Queue(maxsize=RECEIVE_QUEUE_SIZE)
+        reader = threading.Thread(
+            target=self._read_loop, args=(frames, should_stop), name="signal-receive", daemon=True
+        )
+        reader.start()
+        while not should_stop():
+            try:
+                msg = frames.get(timeout=1)
+            except queue.Empty:
+                if not reader.is_alive() and not should_stop():
+                    raise RuntimeError("receive thread stopped")
+                continue
+            try:
+                on_message(msg)
+            except Exception as e:
+                logger.error("Message handler failed (type: %s)", type(e).__name__)
