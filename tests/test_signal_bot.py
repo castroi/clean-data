@@ -11,7 +11,7 @@ from signal_bot import SignalBot
 def _make_config(tmp_path: Path, allowed_senders: str = "") -> Config:
     return Config(
         SIGNAL_PHONE_NUMBER="+972501234567",
-        SIGNAL_CLI_URL="http://localhost:8080",
+        SIGNAL_API_URL="http://localhost:8080",
         TEMP_DIR=tmp_path / "temp",
         MAX_FILE_SIZE_MB=25,
         PROCESSING_TIMEOUT=300,
@@ -26,7 +26,7 @@ def config(tmp_path: Path) -> Config:
 
 @pytest.fixture
 def bot(config: Config):
-    with patch("signal_bot.SignalCliRestApi"):
+    with patch("signal_bot.SignalClient"):
         b = SignalBot(config)
         b._api = MagicMock()
         return b
@@ -133,7 +133,7 @@ def test_process_attachment_downloads_by_id(bot: SignalBot):
     attachment = {"filename": "test.pdf", "size": len(pdf_data), "id": "abc123"}
     bot.handle_message(sender="42cc8f08-8b0a-4a79-a46d-000000000001", message="", attachments=[attachment])
 
-    bot._api.get_attachment.assert_called_once_with("abc123")
+    bot._api.get_attachment.assert_called_once_with("abc123", 25 * 1024 * 1024)
     # Should have sent acknowledgment + result
     assert bot._api.send_message.call_count >= 2
 
@@ -176,8 +176,8 @@ def test_process_attachment_api_content_too_large(bot: SignalBot):
 
 
 def test_send_attachment_sends_bytes(bot: SignalBot, tmp_path: Path):
-    """_send_attachment should read file and send as attachments_as_bytes."""
-    test_file = tmp_path / "cleaned.pdf"
+    """_send_attachment should read the file and send it under a generic name."""
+    test_file = tmp_path / "cleaned_input_ab12_John Smith CV.PDF"
     test_content = b"cleaned pdf content"
     test_file.write_bytes(test_content)
 
@@ -186,7 +186,7 @@ def test_send_attachment_sends_bytes(bot: SignalBot, tmp_path: Path):
     bot._api.send_message.assert_called_once_with(
         message="Done.",
         recipients=["42cc8f08-8b0a-4a79-a46d-000000000001"],
-        attachments_as_bytes=[test_content],
+        attachments=[("cleaned.pdf", test_content)],
     )
 
 
@@ -214,7 +214,7 @@ def test_send_attachment_missing_file(bot: SignalBot, tmp_path: Path):
 def test_allowlist_rejects_unauthorized_sender_silently(tmp_path: Path):
     """Bot with ALLOWED_SENDERS set should silently ignore unauthorized senders."""
     cfg = _make_config(tmp_path, allowed_senders="42cc8f08-8b0a-4a79-a46d-000000000001")
-    with patch("signal_bot.SignalCliRestApi"):
+    with patch("signal_bot.SignalClient"):
         b = SignalBot(cfg)
         b._api = MagicMock()
 
@@ -227,7 +227,7 @@ def test_allowlist_rejects_unauthorized_sender_silently(tmp_path: Path):
 def test_allowlist_allows_authorized_sender(tmp_path: Path):
     """Bot with ALLOWED_SENDERS set should process messages from authorized senders."""
     cfg = _make_config(tmp_path, allowed_senders="42cc8f08-8b0a-4a79-a46d-000000000001, 11111111-2222-3333-4444-555555555555")
-    with patch("signal_bot.SignalCliRestApi"):
+    with patch("signal_bot.SignalClient"):
         b = SignalBot(cfg)
         b._api = MagicMock()
 
@@ -242,7 +242,7 @@ def test_allowlist_allows_authorized_sender(tmp_path: Path):
 def test_allowlist_allows_second_authorized_sender(tmp_path: Path):
     """Bot with ALLOWED_SENDERS set should process messages from authorized senders."""
     cfg = _make_config(tmp_path, allowed_senders="42cc8f08-8b0a-4a79-a46d-000000000001, 11111111-2222-3333-4444-555555555555")
-    with patch("signal_bot.SignalCliRestApi"):
+    with patch("signal_bot.SignalClient"):
         b = SignalBot(cfg)
         b._api = MagicMock()
 
@@ -257,7 +257,7 @@ def test_allowlist_allows_second_authorized_sender(tmp_path: Path):
 def test_allowlist_case_insensitive(tmp_path: Path):
     """UUID matching should be case-insensitive."""
     cfg = _make_config(tmp_path, allowed_senders="42CC8F08-8B0A-4A79-A46D-000000000001")
-    with patch("signal_bot.SignalCliRestApi"):
+    with patch("signal_bot.SignalClient"):
         b = SignalBot(cfg)
         b._api = MagicMock()
 
@@ -270,7 +270,7 @@ def test_allowlist_case_insensitive(tmp_path: Path):
 def test_empty_allowlist_allows_all_senders(tmp_path: Path):
     """Bot with empty ALLOWED_SENDERS should allow any sender."""
     cfg = _make_config(tmp_path, allowed_senders="")
-    with patch("signal_bot.SignalCliRestApi"):
+    with patch("signal_bot.SignalClient"):
         b = SignalBot(cfg)
         b._api = MagicMock()
 
@@ -278,3 +278,72 @@ def test_empty_allowlist_allows_all_senders(tmp_path: Path):
 
     # Any sender should get the usage message when no allowlist is configured
     b._api.send_message.assert_called_once()
+
+
+# --- Tests for on_receive: envelope handling and signal-cli cleanup ---
+
+SENDER_UUID = "42cc8f08-8b0a-4a79-a46d-000000000001"
+
+
+def _frame(data_message: dict, sender: str = SENDER_UUID) -> dict:
+    return {"envelope": {"sourceUuid": sender, "dataMessage": data_message}}
+
+
+def test_on_receive_dispatches_and_deletes_attachment(bot: SignalBot):
+    """Received files are removed from signal-cli storage after handling."""
+    pdf_data = _make_pdf_bytes("Contact John Smith at john@example.com")
+    bot._api.get_attachment.return_value = pdf_data
+    att = {"filename": "a.pdf", "size": len(pdf_data), "id": "att1.pdf"}
+
+    bot.on_receive(_frame({"message": "", "attachments": [att]}))
+
+    bot._api.get_attachment.assert_called_once()
+    bot._api.delete_attachment.assert_called_once_with("att1.pdf")
+
+
+def test_on_receive_deletes_unsupported_attachment(bot: SignalBot):
+    """Rejected files must not linger in signal-cli storage either."""
+    att = {"filename": "a.exe", "size": 10, "id": "att2"}
+    bot.on_receive(_frame({"message": "", "attachments": [att]}))
+
+    bot._api.get_attachment.assert_not_called()
+    bot._api.delete_attachment.assert_called_once_with("att2")
+
+
+def test_on_receive_deletes_attachment_from_unauthorized_sender(tmp_path: Path):
+    config = _make_config(tmp_path, allowed_senders="11111111-2222-3333-4444-555555555555")
+    with patch("signal_bot.SignalClient"):
+        b = SignalBot(config)
+        b._api = MagicMock()
+    att = {"filename": "a.pdf", "size": 10, "id": "att3"}
+
+    b.on_receive(_frame({"message": "", "attachments": [att]}))
+
+    b._api.send_message.assert_not_called()
+    b._api.delete_attachment.assert_called_once_with("att3")
+
+
+def test_on_receive_deletes_even_if_handler_raises(bot: SignalBot):
+    att = {"filename": "a.pdf", "size": 10, "id": "att4"}
+    with patch.object(bot, "handle_message", side_effect=RuntimeError("boom")):
+        with pytest.raises(RuntimeError):
+            bot.on_receive(_frame({"message": "", "attachments": [att]}))
+    bot._api.delete_attachment.assert_called_once_with("att4")
+
+
+def test_on_receive_delete_failure_does_not_raise(bot: SignalBot):
+    bot._api.delete_attachment.side_effect = Exception("wrapper down")
+    att = {"filename": "a.exe", "size": 10, "id": "att5"}
+    bot.on_receive(_frame({"message": "", "attachments": [att]}))
+
+
+def test_on_receive_skips_non_data_frames(bot: SignalBot):
+    bot.on_receive({"envelope": {"sourceUuid": SENDER_UUID, "receiptMessage": {}}})
+    bot._api.send_message.assert_not_called()
+    bot._api.delete_attachment.assert_not_called()
+
+
+def test_on_receive_text_message_gets_usage(bot: SignalBot):
+    bot.on_receive(_frame({"message": "hi"}))
+    msg = _extract_message(bot._api.send_message.call_args)
+    assert "Clean-Data" in msg

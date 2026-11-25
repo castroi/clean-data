@@ -29,7 +29,7 @@ WORKDIR /app
 COPY --from=builder /opt/venv /opt/venv
 
 # Copy application source
-COPY config.py main.py signal_bot.py word_session_store.py ./
+COPY config.py main.py signal_bot.py signal_client.py word_session_store.py ./
 COPY processor/ ./processor/
 COPY utils/ ./utils/
 

@@ -5,11 +5,10 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-from pysignalclirestapi import SignalCliRestApi
-
-from config import Config, parse_allowed_senders
+from config import Config, load_signal_token, parse_allowed_senders
 from processor.custom_word_detector import CustomWordDetector
 from processor.pipeline import CleaningPipeline, ProcessingTimeout
+from signal_client import SignalClient
 from utils.secure_delete import secure_delete, secure_delete_dir
 from word_session_store import WordSessionStore
 
@@ -36,9 +35,10 @@ class SignalBot:
 
     def __init__(self, config: Config | None = None) -> None:
         self._config = config or Config()
-        self._api = SignalCliRestApi(
-            base_url=self._config.SIGNAL_CLI_URL,
+        self._api = SignalClient(
+            base_url=self._config.SIGNAL_API_URL,
             number=self._config.SIGNAL_PHONE_NUMBER,
+            token=load_signal_token(self._config),
         )
         self._pipeline = CleaningPipeline(self._config)
         self._temp_dir = Path(self._config.TEMP_DIR)
@@ -82,10 +82,11 @@ class SignalBot:
         """Send a file attachment to a Signal recipient."""
         try:
             file_bytes = file_path.read_bytes()
+            # Generic name: the original filename may itself contain PII.
             self._api.send_message(
                 message=message,
                 recipients=[recipient],
-                attachments_as_bytes=[file_bytes],
+                attachments=[(f"cleaned{file_path.suffix.lower()}", file_bytes)],
             )
         except Exception as e:
             logger.error("Failed to send attachment: %s", e)
@@ -191,7 +192,7 @@ class SignalBot:
             # Download attachment from signal-cli REST API
             attachment_id = attachment.get("id")
             if attachment_id:
-                content = self._api.get_attachment(attachment_id)
+                content = self._api.get_attachment(attachment_id, max_bytes)
             else:
                 content = attachment.get("data", b"")
                 if isinstance(content, str):
@@ -252,40 +253,48 @@ class SignalBot:
                 if item.is_file():
                     secure_delete(item)
 
+    def _delete_from_signal(self, attachments: list[dict]) -> None:
+        """Remove received files from signal-cli storage (zero retention).
+
+        Runs for every received attachment, whatever happened to it: processed,
+        rejected, rate-limited, or from a sender outside the allowlist.
+        """
+        for attachment in attachments:
+            attachment_id = attachment.get("id")
+            if not attachment_id:
+                continue
+            try:
+                self._api.delete_attachment(attachment_id)
+            except Exception as e:
+                logger.error("Failed to delete attachment from signal-cli (type: %s)", type(e).__name__)
+
+    def on_receive(self, msg: dict) -> None:
+        """Handle one frame from the receive stream."""
+        envelope = msg.get("envelope", {})
+        data_message = envelope.get("dataMessage") or {}
+        if not data_message:
+            return
+
+        attachments = data_message.get("attachments") or []
+        try:
+            sender = envelope.get("sourceUuid") or envelope.get("sourceNumber") or ""
+            if not sender:
+                logger.warning("Message with no sender identifier, skipping")
+                return
+
+            self.handle_message(
+                sender=sender,
+                message=data_message.get("message") or "",
+                attachments=attachments if attachments else None,
+            )
+        finally:
+            self._delete_from_signal(attachments)
+
     def start(self) -> None:
-        """Start polling for incoming Signal messages."""
+        """Listen for incoming Signal messages on the wrapper's receive stream."""
         self._purge_stale_temp_files()
         logger.info("Clean-Data bot started on %s", self._config.SIGNAL_PHONE_NUMBER)
-        logger.info("Polling for messages...")
-
-        while True:
-            try:
-                messages = self._api.receive()
-                for msg in messages:
-                    envelope = msg.get("envelope", {})
-                    account = msg.get("account", "")
-                    data_message = envelope.get("dataMessage", {})
-
-                    if not account or not data_message:
-                        continue
-
-                    sender = envelope.get("sourceUuid") or envelope.get("sourceNumber") or ""
-                    if not sender:
-                        logger.warning("Message with no sender identifier, skipping")
-                        continue
-
-                    text = data_message.get("message", "")
-                    attachments = data_message.get("attachments", [])
-
-                    self.handle_message(
-                        sender=sender,
-                        message=text,
-                        attachments=attachments if attachments else None,
-                    )
-            except KeyboardInterrupt:
-                logger.info("Bot stopped by user")
-                break
-            except Exception as e:
-                logger.error("Error polling messages: %s", e)
-
-            time.sleep(2)
+        try:
+            self._api.receive_forever(self.on_receive)
+        except KeyboardInterrupt:
+            logger.info("Bot stopped by user")

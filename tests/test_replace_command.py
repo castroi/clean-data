@@ -28,7 +28,7 @@ SENDER = "42cc8f08-8b0a-4a79-a46d-000000000001"
 def _make_config(tmp_path: Path) -> Config:
     return Config(
         SIGNAL_PHONE_NUMBER="+972501234567",
-        SIGNAL_CLI_URL="http://localhost:8080",
+        SIGNAL_API_URL="http://localhost:8080",
         TEMP_DIR=tmp_path / "temp",
         MAX_FILE_SIZE_MB=25,
         PROCESSING_TIMEOUT=300,
@@ -37,7 +37,7 @@ def _make_config(tmp_path: Path) -> Config:
 
 
 def _make_bot(config: Config) -> SignalBot:
-    with patch("signal_bot.SignalCliRestApi"):
+    with patch("signal_bot.SignalClient"):
         bot = SignalBot(config)
         bot._api = MagicMock()
         return bot
@@ -182,12 +182,12 @@ def test_pipeline_uses_custom_detector_when_session_active(tmp_path: Path):
     # Verify the bot attempted to send an attachment (cleaned file)
     calls_with_attachment = [
         c for c in bot._api.send_message.call_args_list
-        if c.kwargs.get("attachments_as_bytes")
+        if c.kwargs.get("attachments")
     ]
     assert len(calls_with_attachment) == 1
 
     # Check the cleaned content has "Amit" removed
-    cleaned_bytes = calls_with_attachment[0].kwargs["attachments_as_bytes"][0]
+    cleaned_bytes = calls_with_attachment[0].kwargs["attachments"][0][1]
     cleaned_path = tmp_path / "verify_cleaned.pdf"
     cleaned_path.write_bytes(cleaned_bytes)
     cleaned_text = _read_pdf_text(cleaned_path)
@@ -244,11 +244,11 @@ def test_hebrew_replace_removes_words_from_pdf(tmp_path: Path):
 
     calls_with_attachment = [
         c for c in bot._api.send_message.call_args_list
-        if c.kwargs.get("attachments_as_bytes")
+        if c.kwargs.get("attachments")
     ]
     assert len(calls_with_attachment) == 1
 
-    cleaned_bytes = calls_with_attachment[0].kwargs["attachments_as_bytes"][0]
+    cleaned_bytes = calls_with_attachment[0].kwargs["attachments"][0][1]
     cleaned_path = tmp_path / "verify_heb.pdf"
     cleaned_path.write_bytes(cleaned_bytes)
     cleaned_text = _read_pdf_text(cleaned_path)

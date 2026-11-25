@@ -1,39 +1,72 @@
+# clean-data talks to the SHARED signal-cli only through its own per-bot
+# signal-wrapper (https://github.com/castroi/signal-wrapper). The wrapper pins
+# the sender and receive stream to SIGNAL_PHONE_NUMBER, and is the only service
+# on signal-net. clean-data sits on a private bridge with its wrapper and
+# nothing else. No published ports.
+#
+# Prerequisites (once):
+#   - the shared signal-cli (bbernhard/signal-cli-rest-api, MODE=json-rpc) is
+#     running on the external `signal-net` network with this bot's number
+#     registered on it
+#   - mkdir -p secrets && openssl rand -hex 32 > secrets/signal_token && chmod 600 secrets/signal_token
+
+networks:
+  signal-net: { external: true, name: signal-net }   # the ONE signal-cli's network
+  cleandatanet: { driver: bridge }                    # private: clean-data + its wrapper
+
+secrets:
+  signal_token: { file: ./secrets/signal_token }      # gitignored
+
 services:
-  signal-cli:
-    image: bbernhard/signal-cli-rest-api:latest
+  wrapper-clean-data:
+    image: ghcr.io/castroi/signal-wrapper:latest      # pin by digest in production
     restart: unless-stopped
+    init: true
     environment:
-      - MODE=normal
-    ports:
-      - "8080:8080" # map docker port 8080 to host port 8080.
-    volumes:
-      - "./signal-cli-config:/home/.local/share/signal-cli" # map "signal-cli-config" folder on host system into docker container. the folder contains the password and cryptographic keys when a new number is registered
-    networks:
-      - clean-data-net
+      - BOT_NUMBER=${SIGNAL_PHONE_NUMBER}
+      - BACKEND_URL=${SIGNAL_BACKEND_URL:-http://signal-api:8080}
+      - REQUIRE_SEND_AUTH=true
+      - WS_REQUIRE_AUTH=true
+      - BOT_TOKEN_FILE=/run/secrets/signal_token
+      # File support: download/delete received documents, send cleaned copies.
+      - ALLOW_ATTACHMENTS=true
+      - MAX_ATTACHMENTS=1
+      # Fits a 25 MB file as base64 (~4/3) plus JSON, with headroom for a
+      # cleaned file that grew. Raise together with MAX_FILE_SIZE_MB.
+      - MAX_BODY_BYTES=40000000
+      - REQUEST_READ_TIMEOUT_SEC=30
+      - UPSTREAM_TIMEOUT_SEC=120
+    secrets: [signal_token]
+    read_only: true
+    user: "65532:65532"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 192m   # holds a full send body in memory (default 32m is text-only)
+    networks: [signal-net, cleandatanet]
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8080/v1/about"]
+      test: ["CMD", "/signal-wrapper", "healthcheck"]
       interval: 30s
-      timeout: 10s
+      timeout: 5s
       retries: 3
-      start_period: 40s
 
   clean-data:
     build: .
     restart: unless-stopped
     read_only: true
     depends_on:
-      signal-cli:
+      wrapper-clean-data:
         condition: service_healthy
     env_file:
       - .env
     environment:
-      - SIGNAL_CLI_URL=http://signal-cli:8080
+      - SIGNAL_API_URL=http://wrapper-clean-data:8080
+      - SIGNAL_TOKEN_FILE=/run/secrets/signal_token
       - TEMP_DIR=/tmp/clean-data
+    secrets: [signal_token]
     tmpfs:
       - /tmp/clean-data:size=512M,mode=0700,uid=1000,gid=1000
       - /tmp:size=64M
-    networks:
-      - clean-data-net
+    networks: [cleandatanet]   # only its wrapper; never signal-net
     healthcheck:
       test: ["CMD", "python3", "-c", "import os; os.kill(1, 0)"]
       interval: 30s
@@ -46,10 +79,3 @@ services:
     mem_limit: 2g
     cpus: "2.0"
     pids_limit: 100
-
-volumes:
-  signal-data:
-
-networks:
-  clean-data-net:
-    driver: bridge

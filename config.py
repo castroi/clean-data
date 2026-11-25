@@ -43,7 +43,12 @@ def parse_allowed_senders(raw: str) -> set[str]:
 @dataclass(frozen=True)
 class Config:
     SIGNAL_PHONE_NUMBER: str = os.getenv("SIGNAL_PHONE_NUMBER", "")
-    SIGNAL_CLI_URL: str = os.getenv("SIGNAL_CLI_URL", "http://localhost:8080")
+    # This bot's own signal-wrapper (never signal-cli directly).
+    SIGNAL_API_URL: str = os.getenv("SIGNAL_API_URL", "http://localhost:8080")
+    # Bearer token shared with the wrapper. Prefer the file (Docker secret);
+    # SIGNAL_TOKEN is a fallback for local runs and tests.
+    SIGNAL_TOKEN_FILE: str = os.getenv("SIGNAL_TOKEN_FILE", "")
+    SIGNAL_TOKEN: str = os.getenv("SIGNAL_TOKEN", "")
     TEMP_DIR: Path = Path(os.getenv("TEMP_DIR", "/tmp/clean-data"))
     MAX_FILE_SIZE_MB: int = int(os.getenv("MAX_FILE_SIZE_MB", "25"))
     PROCESSING_TIMEOUT: int = int(os.getenv("PROCESSING_TIMEOUT", "300"))
@@ -52,3 +57,13 @@ class Config:
     MAX_WORDS_PER_SENDER: int = int(os.getenv("MAX_WORDS_PER_SENDER", "15"))
     MAX_WORD_LENGTH: int = int(os.getenv("MAX_WORD_LENGTH", "100"))
     MAX_WORD_SESSIONS: int = int(os.getenv("MAX_WORD_SESSIONS", "100"))
+
+
+def load_signal_token(config: Config) -> str:
+    """Return the wrapper token from SIGNAL_TOKEN_FILE, else SIGNAL_TOKEN.
+
+    Never log the value.
+    """
+    if config.SIGNAL_TOKEN_FILE:
+        return Path(config.SIGNAL_TOKEN_FILE).read_text().strip()
+    return config.SIGNAL_TOKEN.strip()

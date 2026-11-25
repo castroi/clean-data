@@ -13,7 +13,7 @@ Clean-Data is a privacy-first document sanitization service. It receives PDF/DOC
 - **English NER:** spaCy `en_core_web_sm` (falls back from `en_core_web_lg`)
 - **PDF Processing:** PyMuPDF (fitz)
 - **DOCX Processing:** python-docx
-- **Messaging:** Signal via signal-cli REST API (`pysignalclirestapi`)
+- **Messaging:** Signal via this bot's own [signal-wrapper](https://github.com/castroi/signal-wrapper) in front of a shared signal-cli REST API (`MODE=json-rpc`). Transport in `signal_client.py` (`requests` + `websocket-client`)
 - **Config:** python-dotenv (`.env` file)
 - **Tests:** pytest
 
@@ -52,18 +52,21 @@ The project includes a `Dockerfile` and `docker-compose.yml` for containerized d
 # Copy and configure environment
 cp .env.example .env
 
-# Edit .env and set SIGNAL_PHONE_NUMBER to the phone you will register
+# Edit .env: SIGNAL_PHONE_NUMBER and SIGNAL_BACKEND_URL (shared signal-cli on signal-net)
+# Create the wrapper token (Docker secret, never in .env)
+mkdir -p secrets && openssl rand -hex 32 > secrets/signal_token && chmod 600 secrets/signal_token
 
 # Start services
 docker compose up -d
 
-# Register Signal number using curl POST requests
+# Register the number on the SHARED signal-cli directly (the wrapper blocks register)
 # See "Set up a phone number" section in README.md for detailed instructions
 ```
 
-**Architecture:** Two containers run on an internal bridge network:
-- **signal-cli** — bbernhard/signal-cli-rest-api image. Handles Signal protocol, message I/O, attachment storage. Credentials persist in `signal-data` Docker volume.
-- **clean-data** — Custom Python image with all NLP models baked in. Communicates with signal-cli over internal network. Temp files stored on tmpfs mount (PII never touches disk).
+**Architecture:** Two containers in this project, plus a shared signal-cli outside it:
+- **wrapper-clean-data** — `ghcr.io/castroi/signal-wrapper`. Pins sender/receive to `SIGNAL_PHONE_NUMBER`, requires the bearer token (Docker secret `secrets/signal_token`), runs with `ALLOW_ATTACHMENTS=true`. Only service on the external `signal-net`.
+- **clean-data** — Custom Python image with all NLP models baked in. Reaches only its wrapper over a private bridge. Temp files stored on tmpfs mount (PII never touches disk).
+- **shared signal-cli** — bbernhard/signal-cli-rest-api, `MODE=json-rpc`, managed separately.
 
 For complete Signal registration and CAPTCHA troubleshooting instructions, see the "Set up a phone number" section in README.md.
 
@@ -71,9 +74,11 @@ For complete Signal registration and CAPTCHA troubleshooting instructions, see t
 
 ```
 main.py → SignalBot → CleaningPipeline → PDFCleaner / DOCXCleaner → PIIDetector
-                                       → secure_delete (cleanup)
+             │                         → secure_delete (cleanup)
+             └→ SignalClient → wrapper-clean-data → shared signal-cli
 ```
 
+- **`signal_client.py`** — All Signal transport: receive WebSocket (reconnect with backoff, json-rpc frames), `/v2/send` with bearer token and no `number`, attachment download (size-capped) and delete. `session`/`ws_connect` injectable for tests.
 - **`signal_bot.py`** — Signal bot listener. Receives file attachments, dispatches to pipeline, sends back cleaned files. All error paths must still delete the original file. Includes rate limiting, sender allowlist, filename sanitization, and startup temp file purge.
 - **`processor/pipeline.py`** — Orchestrates cleaning. Routes by file extension, enforces timeout, calls secure cleanup.
 - **`processor/pii_detector.py`** — Wraps Presidio with English NLP (spaCy `en_core_web_sm`). Includes custom recognizers for Israeli PII (Teudat Zehut, 05X phones, +972 format).
@@ -88,6 +93,7 @@ main.py → SignalBot → CleaningPipeline → PDFCleaner / DOCXCleaner → PIID
 - **PII removal mode is full deletion** (not redaction or placeholders). Cleaned text has PII stripped entirely.
 - **Zero data retention.** Both original and cleaned files are securely deleted immediately after the cleaned version is sent back via Signal. No temp files should survive a completed or failed processing run.
 - **Signal bot error paths must always clean up.** If processing fails or times out, the original file must still be securely deleted before responding with an error.
+- **Delete received attachments from signal-cli.** `on_receive` deletes every attachment id via the wrapper after handling, on every path (processed, rejected, rate-limited, unauthorized sender).
 
 ## Security Rules
 
@@ -103,4 +109,4 @@ Security rules enforced across the codebase:
 
 ## Configuration
 
-All config via `.env` (see `.env.example`). Key vars: `SIGNAL_PHONE_NUMBER`, `SIGNAL_CLI_URL`, `TEMP_DIR`, `MAX_FILE_SIZE_MB`, `PROCESSING_TIMEOUT`, `ALLOWED_SENDERS` (optional, comma-separated phone numbers).
+All config via `.env` (see `.env.example`). Key vars: `SIGNAL_PHONE_NUMBER`, `SIGNAL_API_URL` (the wrapper), `SIGNAL_TOKEN_FILE` / `SIGNAL_TOKEN`, `SIGNAL_BACKEND_URL` (compose, for the wrapper), `TEMP_DIR`, `MAX_FILE_SIZE_MB`, `PROCESSING_TIMEOUT`, `ALLOWED_SENDERS` (optional, comma-separated phone numbers).
