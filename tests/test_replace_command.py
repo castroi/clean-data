@@ -32,7 +32,7 @@ def _make_config(tmp_path: Path) -> Config:
         TEMP_DIR=tmp_path / "temp",
         MAX_FILE_SIZE_MB=25,
         PROCESSING_TIMEOUT=300,
-        ALLOWED_SENDERS="",
+        ALLOWED_SENDERS="42cc8f08-8b0a-4a79-a46d-000000000001",
     )
 
 

@@ -5,12 +5,11 @@ import pytest
 from config import parse_allowed_senders
 
 
-def test_empty_string_returns_empty_set():
-    assert parse_allowed_senders("") == set()
-
-
-def test_whitespace_only_returns_empty_set():
-    assert parse_allowed_senders("   ") == set()
+@pytest.mark.parametrize("raw", ["", "   ", ",, ,"])
+def test_missing_allowlist_stops_startup(raw):
+    """Required, like ha-signal-remote's ALLOWLIST_UUIDS."""
+    with pytest.raises(ValueError, match="required"):
+        parse_allowed_senders(raw)
 
 
 def test_single_number_returns_one_entry():

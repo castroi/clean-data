@@ -65,10 +65,11 @@ class SignalBot:
         # from signal-cli (so the final sweep doesn't delete them twice).
         self._deleted_ids: set[str] = set()
 
-        # Optional allowlist of Signal UUIDs. Invalid entries stop startup.
+        # Required allowlist of Signal UUIDs (ACIs). Missing/invalid stops startup.
         self._allowed_senders: set[str] = parse_allowed_senders(self._config.ALLOWED_SENDERS)
-        if not self._allowed_senders:
-            logger.warning("ALLOWED_SENDERS is not set: any Signal user can use this bot")
+        # Rejections are logged at most once per window, as a count, never an id.
+        self._rejected_since_log = 0
+        self._last_reject_log = 0.0
 
         # Per-sender custom word sessions for /replace command
         self._word_store = WordSessionStore(
@@ -88,6 +89,14 @@ class SignalBot:
             return True
         limits[sender].append(now)
         return False
+
+    def _log_rejection(self) -> None:
+        self._rejected_since_log += 1
+        now = time.time()
+        if now - self._last_reject_log >= RATE_LIMIT_WINDOW_SECONDS:
+            logger.warning("Dropped %d message(s) from senders not in ALLOWED_SENDERS", self._rejected_since_log)
+            self._rejected_since_log = 0
+            self._last_reject_log = now
 
     def _is_rate_limited(self, sender: str) -> bool:
         """Check if sender has exceeded the file rate limit."""
@@ -144,9 +153,10 @@ class SignalBot:
             message: The text content of the message.
             attachments: List of attachment dicts with 'filename', 'id', 'size' keys.
         """
-        # Allowlist check (if configured). Never log the sender id.
-        if self._allowed_senders and sender.lower() not in self._allowed_senders:
-            logger.warning("Rejected message from a sender not in ALLOWED_SENDERS")
+        # Allowlist first. Unknown senders are dropped silently: no reply, no id
+        # or message logged, only a rate-limited count.
+        if sender.lower() not in self._allowed_senders:
+            self._log_rejection()
             return
 
         # Flood guard for any message (text or file); ignored silently.
@@ -332,11 +342,10 @@ class SignalBot:
             if not isinstance(data_message, dict) or not data_message:
                 return
 
-            # Identity: the ACI (sourceUuid). The number is only a reply
-            # address fallback and never matches the UUID allowlist.
-            sender = envelope.get("sourceUuid") or envelope.get("sourceNumber") or ""
-            if not sender:
-                logger.warning("Message with no sender identifier, skipping")
+            # Identity is pinned on the ACI (sourceUuid), never the phone number
+            # (which can be hidden or change). No UUID -> drop.
+            sender = envelope.get("sourceUuid") or ""
+            if not isinstance(sender, str) or not sender:
                 return
 
             attachments = [a for a in data_message.get("attachments") or [] if isinstance(a, dict)]

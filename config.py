@@ -19,15 +19,14 @@ _VALID_UUID_RE = re.compile(
 def parse_allowed_senders(raw: str) -> set[str]:
     """Parse a comma-separated string of Signal UUIDs (ACIs) into a set.
 
-    Each entry is stripped of surrounding whitespace and lowercased. Returns an
-    empty set for empty/whitespace input, which means "allow every sender".
+    Each entry is stripped of surrounding whitespace and lowercased.
 
-    Fails closed: if ANY entry is not a valid UUID (e.g. a phone number), raise
-    instead of skipping it. Skipping could leave the set empty and silently open
-    the bot to everyone. The rejected values are never logged (they are PII).
+    Required and fail-closed (as in ha-signal-remote): raise if the list is
+    empty, or if ANY entry is not a valid UUID (e.g. a phone number), instead
+    of skipping it. The rejected values are never logged (they are PII).
     """
     if not raw or not raw.strip():
-        return set()
+        raise ValueError("ALLOWED_SENDERS is required: set at least one Signal UUID")
 
     result: set[str] = set()
     invalid = 0
@@ -41,6 +40,8 @@ def parse_allowed_senders(raw: str) -> set[str]:
             continue
         result.add(cleaned)
 
+    if not result and not invalid:
+        raise ValueError("ALLOWED_SENDERS is required: set at least one Signal UUID")
     if invalid:
         raise ValueError(
             f"ALLOWED_SENDERS has {invalid} invalid entr{'y' if invalid == 1 else 'ies'}: "

@@ -8,7 +8,7 @@ from config import Config
 from signal_bot import SignalBot
 
 
-def _make_config(tmp_path: Path, allowed_senders: str = "") -> Config:
+def _make_config(tmp_path: Path, allowed_senders: str = "42cc8f08-8b0a-4a79-a46d-000000000001") -> Config:
     return Config(
         SIGNAL_PHONE_NUMBER="+972501234567",
         SIGNAL_API_URL="http://localhost:8080",
@@ -267,17 +267,12 @@ def test_allowlist_case_insensitive(tmp_path: Path):
     b._api.send_message.assert_called_once()
 
 
-def test_empty_allowlist_allows_all_senders(tmp_path: Path):
-    """Bot with empty ALLOWED_SENDERS should allow any sender."""
+def test_empty_allowlist_stops_startup(tmp_path: Path):
+    """ALLOWED_SENDERS is required: the bot is never open to everyone."""
     cfg = _make_config(tmp_path, allowed_senders="")
     with patch("signal_bot.SignalClient"):
-        b = SignalBot(cfg)
-        b._api = MagicMock()
-
-    b.handle_message(sender="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", message="hello", attachments=None)
-
-    # Any sender should get the usage message when no allowlist is configured
-    b._api.send_message.assert_called_once()
+        with pytest.raises(ValueError, match="required"):
+            SignalBot(cfg)
 
 
 # --- Tests for on_receive: envelope handling and signal-cli cleanup ---

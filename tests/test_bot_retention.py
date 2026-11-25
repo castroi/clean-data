@@ -43,7 +43,7 @@ class FakePipeline:
             Path(p).unlink()
 
 
-def _bot(tmp_path: Path, allowed: str = "", pipeline: FakePipeline | None = None, max_send: int = 40_000_000):
+def _bot(tmp_path: Path, allowed: str = SENDER, pipeline: FakePipeline | None = None, max_send: int = 40_000_000):
     config = Config(
         SIGNAL_PHONE_NUMBER="+15550000001",
         SIGNAL_API_URL="http://localhost:8080",
@@ -146,10 +146,23 @@ def test_unauthorized_sender_files_deleted_and_id_not_logged(tmp_path, caplog):
     assert SENDER not in caplog.text
 
 
-def test_phone_number_sender_never_matches_uuid_allowlist(tmp_path):
-    bot = _bot(tmp_path, allowed=OTHER)
-    bot.on_receive({"envelope": {"sourceNumber": "+972501234567", "dataMessage": {"message": "hi"}}})
+def test_message_without_uuid_is_dropped(tmp_path):
+    """Identity is the sourceUuid only; a phone number alone never counts."""
+    bot = _bot(tmp_path)
+    bot.on_receive({"envelope": {"sourceNumber": "+972501234567", "dataMessage": {"message": "hi",
+                    "attachments": [_att()]}}})
     bot._api.send_message.assert_not_called()
+    assert _deleted(bot) == ["att1"]  # its file is still removed from signal-cli
+
+
+def test_rejections_logged_as_rate_limited_count(tmp_path, caplog):
+    bot = _bot(tmp_path, allowed=OTHER)
+    with caplog.at_level(logging.WARNING):
+        for _ in range(10):
+            bot.on_receive(_frame({"message": "hi"}))
+    lines = [r for r in caplog.records if "not in ALLOWED_SENDERS" in r.getMessage()]
+    assert len(lines) == 1
+    assert SENDER not in caplog.text and "hi" not in caplog.text
 
 
 def test_unsupported_and_rate_limited_files_deleted(tmp_path):
@@ -242,12 +255,7 @@ def test_text_flood_is_capped(tmp_path):
     assert bot._api.send_message.call_count == signal_bot.RATE_LIMIT_MAX_MESSAGES
 
 
-def test_open_bot_warns_at_startup(tmp_path, caplog):
-    with caplog.at_level(logging.WARNING):
-        _bot(tmp_path)
-    assert "any Signal user" in caplog.text
-
-
-def test_invalid_allowlist_stops_startup(tmp_path):
+@pytest.mark.parametrize("allowed", ["", "+972501234567", f"{SENDER},+972501234567"])
+def test_missing_or_invalid_allowlist_stops_startup(tmp_path, allowed):
     with pytest.raises(ValueError):
-        _bot(tmp_path, allowed="+972501234567")
+        _bot(tmp_path, allowed=allowed)
