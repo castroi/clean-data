@@ -1,5 +1,6 @@
 import base64
 import json
+import threading
 import time
 from unittest.mock import MagicMock
 
@@ -269,3 +270,52 @@ def test_receive_backoff_caps_and_survives_handler_errors():
         raise ValueError("document text")
 
     _run(_client(ws_connect=lambda u, h: ws), handler, lambda: len(calls) >= 2)
+
+
+def test_delete_shutdown_limits():
+    session = MagicMock()
+    session.delete.return_value = _resp(503)
+    with pytest.raises(RuntimeError):
+        _client(session).delete_attachment("abc", timeout=2.5, attempts=1)
+    assert session.delete.call_count == 1
+    assert session.delete.call_args.kwargs["timeout"] == 2.5
+
+
+def test_shutdown_hands_queued_frames_to_on_shutdown():
+    """SystemExit while handling: the reader stops, queued frames go to on_shutdown."""
+    env = {"sourceUuid": SENDER, "dataMessage": {"message": "x"}}
+    frames = [json.dumps({"envelope": {**env, "n": i}}) for i in range(4)]
+    ws = _FakeWS(frames)
+    handled, drained = [], []
+
+    def handler(m):
+        handled.append(m)
+        deadline = time.time() + 2
+        while ws._frames and time.time() < deadline:  # let the reader queue the rest
+            time.sleep(0.01)
+        raise SystemExit(0)  # docker stop during the first message
+
+    with pytest.raises(SystemExit):
+        _client(ws_connect=lambda u, h: ws).receive_forever(handler, on_shutdown=drained.extend)
+    assert [m["envelope"]["n"] for m in handled] == [0]
+    assert [m["envelope"]["n"] for m in drained] == [1, 2, 3]
+
+
+def test_shutdown_without_queued_frames_skips_callback():
+    ws = _FakeWS([])
+    called = []
+
+    def handler(m):
+        raise AssertionError("no frames")
+
+    stop_at = time.time() + 0.3
+
+    def stop():
+        # Ctrl-C/SIGTERM land on the main thread only; the reader just polls.
+        if time.time() > stop_at and threading.current_thread() is threading.main_thread():
+            raise KeyboardInterrupt
+        return False
+
+    with pytest.raises(KeyboardInterrupt):
+        _client(ws_connect=lambda u, h: ws).receive_forever(handler, should_stop=stop, on_shutdown=called.append)
+    assert called == []

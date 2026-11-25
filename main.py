@@ -1,6 +1,7 @@
 import logging
 import signal
 
+import shutdown
 from config import Config
 from signal_bot import SignalBot
 
@@ -10,15 +11,13 @@ logging.basicConfig(
 )
 
 
-def _stop(signum, frame) -> None:
-    # Turn `docker stop` (SIGTERM) into SystemExit on the main thread, so the
-    # in-flight message's finally blocks run: temp files are securely deleted
-    # and received attachments are deleted from signal-cli.
-    raise SystemExit(0)
-
-
 def main() -> None:
-    signal.signal(signal.SIGTERM, _stop)
+    # `docker stop` (SIGTERM) becomes SystemExit on the main thread, so the
+    # in-flight message's finally blocks run (temp files securely deleted,
+    # received attachments deleted from signal-cli). Delete sweeps are never
+    # interrupted: the exit is postponed until they finish (see shutdown.py),
+    # and files of messages still queued are deleted before exiting.
+    signal.signal(signal.SIGTERM, shutdown.request)
     config = Config()
     bot = SignalBot(config)
     bot.start()

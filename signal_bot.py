@@ -5,6 +5,7 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
+import shutdown
 from config import Config, load_signal_token, parse_allowed_senders
 from processor.custom_word_detector import CustomWordDetector
 from processor.pipeline import CleaningPipeline, ProcessingTimeout, output_path_for
@@ -20,6 +21,9 @@ RATE_LIMIT_WINDOW_SECONDS = 60
 # Any message (text or file) per sender per window; beyond it, messages are
 # ignored silently (attachments are still deleted from signal-cli).
 RATE_LIMIT_MAX_MESSAGES = 20
+
+# Per-delete limits once shutdown has started (all must fit the shutdown budget).
+SHUTDOWN_DELETE_TIMEOUT_SECONDS = 5.0
 
 DONE_MESSAGE = (
     "Done. Your original has been deleted from the server, and this cleaned "
@@ -132,9 +136,21 @@ class SignalBot:
         return encoded + 1024 <= self._config.SIGNAL_MAX_SEND_BYTES
 
     def _delete_original(self, attachment_id: str) -> bool:
-        """Delete one received file from signal-cli. Returns True if it is gone."""
+        """Delete one received file from signal-cli. Returns True if it is gone.
+
+        Once shutdown has started, one short attempt each, and nothing after
+        the shutdown budget is spent (the container is about to be killed).
+        """
         try:
-            self._api.delete_attachment(attachment_id)
+            if shutdown.requested():
+                left = shutdown.remaining()
+                if left <= 0:
+                    return False
+                self._api.delete_attachment(
+                    attachment_id, timeout=min(SHUTDOWN_DELETE_TIMEOUT_SECONDS, left), attempts=1
+                )
+            else:
+                self._api.delete_attachment(attachment_id)
         except Exception as e:
             logger.error("Failed to delete attachment from signal-cli (type: %s)", type(e).__name__)
             return False
@@ -334,7 +350,7 @@ class SignalBot:
         messages, previews, quote thumbnails, contact avatars, ...) is deleted
         from signal-cli when the frame is done, whatever happened to it.
         """
-        ids = collect_attachment_ids(msg)
+        ids = frame_attachment_ids(msg)
         self._deleted_ids = set()
         try:
             envelope = msg.get("envelope") or {}
@@ -349,24 +365,60 @@ class SignalBot:
                 return
 
             attachments = [a for a in data_message.get("attachments") or [] if isinstance(a, dict)]
-            ids.update(a["id"] for a in attachments if isinstance(a.get("id"), str) and a["id"])
             self.handle_message(
                 sender=sender,
                 message=data_message.get("message") or "",
                 attachments=attachments if attachments else None,
             )
         finally:
-            for attachment_id in ids - self._deleted_ids:
-                self._delete_original(attachment_id)
+            # A SIGTERM arriving here is postponed until every id was tried.
+            with shutdown.deferred():
+                for attachment_id in ids - self._deleted_ids:
+                    self._delete_original(attachment_id)
+
+    def on_shutdown(self, frames: list[dict]) -> None:
+        """Delete the attachments of frames still queued at shutdown.
+
+        signal-cli does not redeliver them, so without this their files would
+        stay in its store for good. They are not processed or answered.
+        """
+        ids: set[str] = set()
+        for msg in frames:
+            ids |= frame_attachment_ids(msg)
+        if not ids:
+            return
+        deleted = 0
+        with shutdown.deferred():
+            for attachment_id in ids:
+                if self._delete_original(attachment_id):
+                    deleted += 1
+        logger.warning(
+            "Shutdown: deleted %d of %d attachment(s) from %d unprocessed message(s)",
+            deleted, len(ids), len(frames),
+        )
 
     def start(self) -> None:
         """Listen for incoming Signal messages on the wrapper's receive stream."""
         self._purge_stale_temp_files()
         logger.info("Clean-Data bot started on %s", self._config.SIGNAL_PHONE_NUMBER)
         try:
-            self._api.receive_forever(self.on_receive)
+            self._api.receive_forever(self.on_receive, on_shutdown=self.on_shutdown)
         except (KeyboardInterrupt, SystemExit):
             logger.info("Bot stopped")
+
+
+def frame_attachment_ids(msg: dict) -> set[str]:
+    """All attachment ids in a receive frame: every attachment-shaped object,
+    plus anything listed in dataMessage.attachments even if fields are missing.
+    """
+    ids = collect_attachment_ids(msg)
+    envelope = msg.get("envelope") if isinstance(msg, dict) else None
+    data_message = envelope.get("dataMessage") if isinstance(envelope, dict) else None
+    if isinstance(data_message, dict):
+        for a in data_message.get("attachments") or []:
+            if isinstance(a, dict) and isinstance(a.get("id"), str) and a["id"]:
+                ids.add(a["id"])
+    return ids
 
 
 def collect_attachment_ids(obj: object, _depth: int = 0) -> set[str]:

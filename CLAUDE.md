@@ -86,6 +86,7 @@ main.py → SignalBot → CleaningPipeline → PDFCleaner / DOCXCleaner → PIID
 - **`processor/pdf_cleaner.py`** / **`processor/docx_cleaner.py`** — Format-specific cleaners. Extract text, run through PIIDetector, rebuild document, strip metadata.
 - **`processor/metadata.py`** — Strips all document metadata fields (author, dates, creator, etc.).
 - **`utils/secure_delete.py`** — Overwrites file contents with random bytes then zeros before unlinking. Used for both original and cleaned files after sending.
+- **`shutdown.py`** — SIGTERM handling: SystemExit now, or postponed while inside `deferred()` (delete sweeps); shutdown time budget.
 - **`config.py`** — Loads settings from `.env` with defaults.
 
 ## Key Design Constraints
@@ -94,7 +95,7 @@ main.py → SignalBot → CleaningPipeline → PDFCleaner / DOCXCleaner → PIID
 - **PII removal mode is full deletion** (not redaction or placeholders). Cleaned text has PII stripped entirely.
 - **Zero data retention.** Both original and cleaned files are securely deleted immediately after the cleaned version is sent back via Signal. No temp files should survive a completed or failed processing run.
 - **Signal bot error paths must always clean up.** If processing fails or times out, the original file must still be securely deleted before responding with an error.
-- **Delete received attachments from signal-cli.** A document's original is deleted via the wrapper right after it is downloaded (with retries), before processing. `on_receive` then deletes every remaining attachment id found anywhere in the frame (`collect_attachment_ids`: edit/sync/story messages, previews, quote thumbnails, avatars), on every path. The "deleted" text is only sent when the delete succeeded. SIGTERM becomes SystemExit so these `finally` blocks run on `docker stop`.
+- **Delete received attachments from signal-cli.** A document's original is deleted via the wrapper right after it is downloaded (with retries), before processing. `on_receive` then deletes every remaining attachment id found anywhere in the frame (`collect_attachment_ids`: edit/sync/story messages, previews, quote thumbnails, avatars), on every path. The "deleted" text is only sent when the delete succeeded. SIGTERM becomes SystemExit so these `finally` blocks run on `docker stop` (`shutdown.py`): inside a delete sweep the exit is postponed until the sweep ends (`shutdown.deferred()`), deletes after SIGTERM are single 5 s attempts within a 20 s budget (< `stop_grace_period` 30 s), and frames still queued at shutdown are not processed but their attachments are deleted (`SignalBot.on_shutdown`), because signal-cli does not redeliver them.
 - **Temp names carry no user data.** `input_<token_hex><ext>`; the user's filename never touches disk or logs.
 - **Receive on a thread, process on the main thread.** `SignalClient.receive_forever` reads the WebSocket (pings, reconnects) on a background thread and queues frames; processing stays on the main thread because the pipeline timeout (SIGALRM) and shutdown (SIGTERM) need it.
 

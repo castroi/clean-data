@@ -178,22 +178,29 @@ class SignalClient:
         finally:
             resp.close()
 
-    def delete_attachment(self, attachment_id: str) -> None:
+    def delete_attachment(
+        self, attachment_id: str, timeout: float | None = None, attempts: int | None = None
+    ) -> None:
         """Remove a received attachment from signal-cli storage.
 
         Retries transient failures. A 404 counts as success (already gone).
-        Raises after DELETE_ATTEMPTS failed attempts.
+        Raises after ``attempts`` (default DELETE_ATTEMPTS) failed attempts.
+        ``timeout``/``attempts`` are lowered during shutdown to fit the grace
+        period.
         """
         url = f"{self._base}/v1/attachments/{quote(attachment_id, safe='')}"
-        for attempt in range(1, DELETE_ATTEMPTS + 1):
+        attempts = attempts or DELETE_ATTEMPTS
+        for attempt in range(1, attempts + 1):
             try:
-                resp = self._session.delete(url, headers=self._headers(), timeout=HTTP_TIMEOUT_SECONDS)
+                resp = self._session.delete(
+                    url, headers=self._headers(), timeout=timeout or HTTP_TIMEOUT_SECONDS
+                )
                 if resp.status_code == 404:
                     return
                 resp.raise_for_status()
                 return
             except Exception:
-                if attempt == DELETE_ATTEMPTS:
+                if attempt == attempts:
                     raise
                 self._sleep(attempt)
 
@@ -261,6 +268,7 @@ class SignalClient:
         self,
         on_message: Callable[[dict], None],
         should_stop: Callable[[], bool] = lambda: False,
+        on_shutdown: Callable[[list[dict]], None] | None = None,
     ) -> None:
         """Receive envelopes on a reader thread; call ``on_message`` on this thread.
 
@@ -268,20 +276,41 @@ class SignalClient:
         timeout uses SIGALRM and shutdown uses SIGTERM, which Python delivers
         only to the main thread. ``on_message`` errors are logged by type only
         (they may carry document content) and never stop the loop.
+
+        On shutdown (SystemExit / KeyboardInterrupt) the reader is stopped and
+        every frame still queued is handed to ``on_shutdown`` before the
+        exception propagates: signal-cli does not redeliver them, so this is
+        the last chance to delete their attachments.
         """
         frames: queue.Queue[dict] = queue.Queue(maxsize=RECEIVE_QUEUE_SIZE)
+        stop_reader = threading.Event()
         reader = threading.Thread(
-            target=self._read_loop, args=(frames, should_stop), name="signal-receive", daemon=True
+            target=self._read_loop,
+            args=(frames, lambda: should_stop() or stop_reader.is_set()),
+            name="signal-receive",
+            daemon=True,
         )
         reader.start()
-        while not should_stop():
-            try:
-                msg = frames.get(timeout=1)
-            except queue.Empty:
-                if not reader.is_alive() and not should_stop():
-                    raise RuntimeError("receive thread stopped")
-                continue
-            try:
-                on_message(msg)
-            except Exception as e:
-                logger.error("Message handler failed (type: %s)", type(e).__name__)
+        try:
+            while not should_stop():
+                try:
+                    msg = frames.get(timeout=1)
+                except queue.Empty:
+                    if not reader.is_alive() and not should_stop():
+                        raise RuntimeError("receive thread stopped")
+                    continue
+                try:
+                    on_message(msg)
+                except Exception as e:
+                    logger.error("Message handler failed (type: %s)", type(e).__name__)
+        except (SystemExit, KeyboardInterrupt):
+            stop_reader.set()
+            pending: list[dict] = []
+            while True:
+                try:
+                    pending.append(frames.get_nowait())
+                except queue.Empty:
+                    break
+            if on_shutdown is not None and pending:
+                on_shutdown(pending)
+            raise

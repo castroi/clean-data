@@ -271,7 +271,7 @@ pytest tests/test_signal_bot.py -v
 
 ## Privacy Principles
 
-- **Zero data retention** — all files are deleted immediately after processing, including the copy signal-cli keeps of each received attachment (deleted right after download, and every other attachment in a message — previews, quote thumbnails, edits, stories — when the message is done). Caveats: a hard crash or OOM kill between download and delete can leave the original in signal-cli, and files sent to the shared signal-cli's other (text-only) bots are not deleted by anyone (castroi/signal-wrapper#23).
+- **Zero data retention** — all files are deleted immediately after processing, including the copy signal-cli keeps of each received attachment (deleted right after download, and every other attachment in a message — previews, quote thumbnails, edits, stories — when the message is done). On `docker stop`, a delete sweep in progress is finished first, and files of messages still waiting in the queue are deleted without processing them. Caveats: a hard crash, OOM kill or SIGKILL between download and delete can leave the original in signal-cli, and so can messages that arrive while the bot is down, and files sent to the shared signal-cli's other (text-only) bots are not deleted by anyone (castroi/signal-wrapper#23).
 - **No external API calls** — all NLP models run locally on CPU
 - **No PII in logs** — exception details are logged at DEBUG level only
 - **End-to-end encrypted** — all communication via Signal

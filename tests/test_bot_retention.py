@@ -4,17 +4,30 @@ Uses a fake pipeline (no PyMuPDF/Presidio work) so it exercises only the bot's
 handling of frames, files and the Signal transport.
 """
 import logging
+import os
+import signal
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+import shutdown
 import signal_bot
 from config import Config
 from processor.pipeline import ProcessingTimeout, output_path_for
 from signal_bot import DONE_MESSAGE, DONE_MESSAGE_NOT_DELETED, SignalBot, collect_attachment_ids
 
 SENDER = "42cc8f08-8b0a-4a79-a46d-000000000001"
+
+
+@pytest.fixture(autouse=True)
+def _clean_shutdown_state():
+    """Real SIGTERM handler for these tests; state reset around each."""
+    shutdown.reset()
+    old = signal.signal(signal.SIGTERM, shutdown.request)
+    yield
+    signal.signal(signal.SIGTERM, old)
+    shutdown.reset()
 OTHER = "11111111-2222-3333-4444-555555555555"
 PDF = b"%PDF-1.4 fake original with John Smith"
 
@@ -278,3 +291,88 @@ def test_only_exact_uuid_matches(tmp_path, near_miss):
     bot = _bot(tmp_path)
     bot.on_receive(_frame({"message": "hi"}, sender=near_miss))
     bot._api.send_message.assert_not_called()
+
+
+# --- shutdown: sweeps are never cut short; queued frames are cleaned (N1, N2) ---
+
+
+def _previews(*ids):
+    return [{"url": "x", "image": {"id": i, "contentType": "image/jpeg"}} for i in ids]
+
+
+def test_sigterm_during_sweep_still_deletes_every_file(tmp_path):
+    """A real SIGTERM arriving mid-sweep is postponed until the sweep ends."""
+    bot = _bot(tmp_path)
+    calls = []
+
+    def delete(attachment_id, **kwargs):
+        calls.append((attachment_id, kwargs))
+        if len(calls) == 1:
+            os.kill(os.getpid(), signal.SIGTERM)  # docker stop, right now
+
+    bot._api.delete_attachment.side_effect = delete
+    with pytest.raises(SystemExit):
+        bot.on_receive(_frame({"message": "links", "previews": _previews("p1", "p2", "p3")}))
+    assert sorted(c[0] for c in calls) == ["p1", "p2", "p3"]
+    # after the request, deletes are single short attempts
+    for _, kwargs in calls[1:]:
+        assert kwargs["attempts"] == 1 and kwargs["timeout"] <= signal_bot.SHUTDOWN_DELETE_TIMEOUT_SECONDS
+
+
+def test_sigterm_during_processing_then_sweep_completes(tmp_path):
+    """SIGTERM while cleaning: original already gone; other files still swept."""
+    pipeline = FakePipeline()
+    bot = _bot(tmp_path, pipeline=pipeline)
+
+    def process(input_path, detector=None):
+        os.kill(os.getpid(), signal.SIGTERM)
+        raise AssertionError("not reached")
+
+    pipeline.process = process
+    with pytest.raises(SystemExit):
+        bot.on_receive(_frame({"message": "", "attachments": [_att()], "previews": _previews("p1")}))
+    assert sorted(_deleted(bot)) == ["att1", "p1"]
+    assert list((tmp_path / "temp").iterdir()) == []
+
+
+def test_shutdown_budget_spent_skips_remaining_deletes(tmp_path, monkeypatch):
+    bot = _bot(tmp_path)
+    monkeypatch.setattr(shutdown, "SHUTDOWN_BUDGET_SECONDS", 0.0)
+    with shutdown.deferred():
+        shutdown.request()
+        assert bot._delete_original("x") is False
+        bot._api.delete_attachment.assert_not_called()
+        shutdown.reset()  # leave the block without exiting the test
+
+
+def test_on_shutdown_deletes_files_of_queued_frames(tmp_path, caplog):
+    bot = _bot(tmp_path)
+    shutdown._requested_at = None
+    queued = [
+        _frame({"message": "", "attachments": [{"id": "q1", "filename": "John.pdf"}]}),  # no contentType
+        _frame({"message": "x", "previews": _previews("q2")}, sender=OTHER),               # unknown sender
+        _frame(None, storyMessage={"fileAttachment": {"id": "q3", "contentType": "image/png"}}),
+        _frame({"message": "plain text"}),                                                # nothing to delete
+    ]
+    with caplog.at_level(logging.INFO):
+        bot.on_shutdown(queued)
+    assert sorted(_deleted(bot)) == ["q1", "q2", "q3"]
+    bot._api.send_message.assert_not_called()   # not processed or answered
+    bot._api.get_attachment.assert_not_called()
+    assert "deleted 3 of 3 attachment(s) from 4 unprocessed message(s)" in caplog.text
+    assert "q1" not in caplog.text and "John" not in caplog.text and SENDER not in caplog.text
+
+
+def test_sigterm_during_on_shutdown_does_not_cut_it_short(tmp_path):
+    bot = _bot(tmp_path)
+    calls = []
+
+    def delete(attachment_id, **kwargs):
+        calls.append(attachment_id)
+        if len(calls) == 1:
+            os.kill(os.getpid(), signal.SIGTERM)  # a second docker stop / kill -TERM
+
+    bot._api.delete_attachment.side_effect = delete
+    with pytest.raises(SystemExit):
+        bot.on_shutdown([_frame({"message": "x", "previews": _previews("a", "b", "c")})])
+    assert sorted(calls) == ["a", "b", "c"]
