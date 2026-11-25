@@ -6,9 +6,18 @@ from unittest.mock import MagicMock
 
 import pytest
 
+import shutdown
+import signal_client
 from signal_client import MAX_MISSED_PINGS, SignalClient, WSTimeout, parse_frame, to_data_uri
 
 TOKEN = "t" * 32
+
+
+@pytest.fixture(autouse=True)
+def _no_shutdown_state():
+    shutdown.reset()
+    yield
+    shutdown.reset()
 NUMBER = "+15550000001"
 SENDER = "42cc8f08-8b0a-4a79-a46d-000000000001"
 
@@ -272,13 +281,51 @@ def test_receive_backoff_caps_and_survives_handler_errors():
     _run(_client(ws_connect=lambda u, h: ws), handler, lambda: len(calls) >= 2)
 
 
-def test_delete_shutdown_limits():
+def test_delete_normal_timeout_is_short():
+    session = MagicMock()
+    session.delete.return_value = _resp(204)
+    _client(session).delete_attachment("abc")
+    assert session.delete.call_args.kwargs["timeout"] == signal_client.DELETE_TIMEOUT_SECONDS
+
+
+def _start_shutdown():
+    shutdown._requested_at = time.monotonic()  # as if SIGTERM was handled
+
+
+def test_delete_after_shutdown_is_one_short_attempt():
     session = MagicMock()
     session.delete.return_value = _resp(503)
+    sleeps = []
+    _start_shutdown()
     with pytest.raises(RuntimeError):
-        _client(session).delete_attachment("abc", timeout=2.5, attempts=1)
+        _client(session, sleep=sleeps.append).delete_attachment("abc")
     assert session.delete.call_count == 1
-    assert session.delete.call_args.kwargs["timeout"] == 2.5
+    assert session.delete.call_args.kwargs["timeout"] <= signal_client.SHUTDOWN_DELETE_TIMEOUT_SECONDS
+    assert sleeps == []
+
+
+def test_delete_running_when_shutdown_starts_stops_retrying():
+    """Finding 3: the limits apply per attempt, not only before the delete."""
+    session = MagicMock()
+
+    def first_attempt(*a, **k):
+        _start_shutdown()  # SIGTERM arrives during attempt 1
+        return _resp(503)
+
+    session.delete.side_effect = first_attempt
+    sleeps = []
+    with pytest.raises(RuntimeError):
+        _client(session, sleep=sleeps.append).delete_attachment("abc")
+    assert session.delete.call_count == 1 and sleeps == []
+
+
+def test_delete_when_budget_spent_raises_timeout(monkeypatch):
+    session = MagicMock()
+    monkeypatch.setattr(shutdown, "SHUTDOWN_BUDGET_SECONDS", 0.0)
+    _start_shutdown()
+    with pytest.raises(TimeoutError):
+        _client(session).delete_attachment("abc")
+    session.delete.assert_not_called()
 
 
 def test_shutdown_hands_queued_frames_to_on_shutdown():
@@ -298,7 +345,8 @@ def test_shutdown_hands_queued_frames_to_on_shutdown():
     with pytest.raises(SystemExit):
         _client(ws_connect=lambda u, h: ws).receive_forever(handler, on_shutdown=drained.extend)
     assert [m["envelope"]["n"] for m in handled] == [0]
-    assert [m["envelope"]["n"] for m in drained] == [1, 2, 3]
+    # the in-flight frame first (its handler was cut short), then the queue
+    assert [m["envelope"]["n"] for m in drained] == [0, 1, 2, 3]
 
 
 def test_shutdown_without_queued_frames_skips_callback():
@@ -319,3 +367,77 @@ def test_shutdown_without_queued_frames_skips_callback():
     with pytest.raises(KeyboardInterrupt):
         _client(ws_connect=lambda u, h: ws).receive_forever(handler, should_stop=stop, on_shutdown=called.append)
     assert called == []
+
+
+class _BlockingWS(_FakeWS):
+    """read() blocks like a real socket until a frame is available or abort()."""
+
+    def __init__(self, frames):
+        super().__init__(frames)
+        self._cond = threading.Condition()
+        self.aborted = False
+
+    def read(self):
+        with self._cond:
+            while not self._frames and not self.aborted:
+                self._cond.wait(0.05)
+            if self.aborted:
+                raise ConnectionError("aborted")
+            return self._frames.pop(0)
+
+    def feed(self, frame):
+        with self._cond:
+            self._frames.append(frame)
+            self._cond.notify_all()
+
+    def abort(self):
+        with self._cond:
+            self.aborted = True
+            self._cond.notify_all()
+
+
+def _env(n):
+    return json.dumps({"envelope": {"sourceUuid": SENDER, "dataMessage": {"message": "x"}, "n": n}})
+
+
+def test_shutdown_with_full_queue_loses_nothing(monkeypatch):
+    """Finding 1B: reader blocked handing over a frame on a full queue."""
+    monkeypatch.setattr(signal_client, "RECEIVE_QUEUE_SIZE", 2)
+    ws = _BlockingWS([_env(i) for i in range(6)])
+    handled, drained = [], []
+
+    def handler(m):
+        handled.append(m)
+        deadline = time.time() + 2
+        while ws._frames and time.time() < deadline:  # reader fills the queue and blocks
+            time.sleep(0.01)
+        time.sleep(0.05)
+        raise SystemExit(0)
+
+    client = _client(ws_connect=lambda u, h: ws)
+    with pytest.raises(SystemExit):
+        client.receive_forever(handler, on_shutdown=drained.extend)
+    # every frame the reader took (in flight, queued, and the one it was
+    # blocked handing over) reaches on_shutdown; 4 and 5 were never read
+    assert sorted(m["envelope"]["n"] for m in drained) == [0, 1, 2, 3]
+    assert len(ws._frames) == 2
+    assert ws.aborted
+
+
+def test_shutdown_closes_stream_so_late_frames_are_not_taken():
+    """Finding 1A: after shutdown starts, nothing more is read from signal-cli."""
+    ws = _BlockingWS([_env(0)])
+    drained = []
+    readers = []
+
+    def handler(m):
+        readers.extend(t for t in threading.enumerate() if t.name == "signal-receive")
+        raise SystemExit(0)
+
+    with pytest.raises(SystemExit):
+        _client(ws_connect=lambda u, h: ws).receive_forever(handler, on_shutdown=drained.extend)
+    assert ws.aborted
+    assert readers and not any(t.is_alive() for t in readers)  # reader has exited
+    ws.feed(_env(99))  # a message arriving now stays in signal-cli (not consumed)
+    assert ws._frames  # nobody read it
+    assert [m["envelope"]["n"] for m in drained] == [0]

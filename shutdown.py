@@ -9,6 +9,15 @@ a sweep is never cut short.
 After a shutdown request there is a fixed time budget (inside compose's
 ``stop_grace_period``) for the remaining deletes; ``remaining()`` reports it.
 Signal handlers run only on the main thread, which is where all of this runs.
+
+Only the first request counts: a second SIGTERM (or Ctrl-C, which main.py
+routes here too) while already shutting down is ignored, so it cannot cut the
+cleanup short. SIGKILL still stops the process at once.
+
+Caveat: Python runs the handler between bytecodes, so a SIGTERM arriving
+during a long C call (PyMuPDF/spaCy) is seen only when that call returns, and
+the budget clock starts then. If such a call outlasts the grace period minus
+the budget, docker's SIGKILL can still land before every delete was tried.
 """
 
 import time
@@ -24,10 +33,12 @@ _depth = 0
 
 
 def request(signum=None, frame=None) -> None:
-    """SIGTERM handler: record the request; exit now unless inside deferred()."""
+    """SIGTERM/SIGINT handler: on the first request exit now, unless inside
+    deferred(); later requests are ignored (shutdown is already under way)."""
     global _requested_at
-    if _requested_at is None:
-        _requested_at = time.monotonic()
+    if _requested_at is not None:
+        return
+    _requested_at = time.monotonic()
     if _depth == 0:
         raise SystemExit(0)
 

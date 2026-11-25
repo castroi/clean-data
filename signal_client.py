@@ -22,6 +22,8 @@ from urllib.parse import quote, urlsplit, urlunsplit
 
 import requests
 
+import shutdown
+
 logger = logging.getLogger(__name__)
 
 # Must outlast the wrapper's own deadline for a file send (UPSTREAM_TIMEOUT_SEC=120
@@ -37,6 +39,13 @@ MAX_MISSED_PINGS = 2
 # small (ids, never file contents); when full, the reader waits.
 RECEIVE_QUEUE_SIZE = 1000
 DELETE_ATTEMPTS = 3
+# Deleting a local file through the wrapper is quick; keep any single attempt
+# short so one slow delete cannot use up docker's stop grace period.
+DELETE_TIMEOUT_SECONDS = 15
+SHUTDOWN_DELETE_TIMEOUT_SECONDS = 5.0
+# How long shutdown waits for the reader thread to finish after closing the
+# connection (it can only be blocked handing over a frame already read).
+READER_STOP_SECONDS = 5.0
 
 _MIME_BY_EXT = {
     ".pdf": "application/pdf",
@@ -82,6 +91,15 @@ class _WSConnection:
 
     def close(self) -> None:
         self._ws.close()
+
+    def abort(self) -> None:
+        """Close the socket at once, from another thread, without a close
+        handshake. Unblocks a read() in progress on the reader thread."""
+        shutdown_socket = getattr(self._ws, "shutdown", None)
+        if shutdown_socket is not None:
+            shutdown_socket()
+        else:
+            self._ws.close()
 
 
 def _default_ws_connect(url: str, headers: list[str]) -> _WSConnection:
@@ -133,6 +151,7 @@ class SignalClient:
         self._ws_connect = ws_connect or _default_ws_connect
         self._sleep = sleep
         self._heartbeat_path = heartbeat_path
+        self._current_ws: Any = None  # the reader's open connection, for abort()
 
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self._token}"} if self._token else {}
@@ -178,29 +197,35 @@ class SignalClient:
         finally:
             resp.close()
 
-    def delete_attachment(
-        self, attachment_id: str, timeout: float | None = None, attempts: int | None = None
-    ) -> None:
+    def delete_attachment(self, attachment_id: str) -> None:
         """Remove a received attachment from signal-cli storage.
 
-        Retries transient failures. A 404 counts as success (already gone).
-        Raises after ``attempts`` (default DELETE_ATTEMPTS) failed attempts.
-        ``timeout``/``attempts`` are lowered during shutdown to fit the grace
-        period.
+        Retries transient failures; a 404 counts as success (already gone).
+        Raises after DELETE_ATTEMPTS failed attempts.
+
+        Once shutdown has started (checked before every attempt, so this also
+        applies to a delete already running when SIGTERM arrives): no more
+        retries or backoff, each attempt at most SHUTDOWN_DELETE_TIMEOUT_SECONDS
+        and never past the shutdown budget (raises TimeoutError when spent).
         """
         url = f"{self._base}/v1/attachments/{quote(attachment_id, safe='')}"
-        attempts = attempts or DELETE_ATTEMPTS
-        for attempt in range(1, attempts + 1):
+        attempt = 0
+        while True:
+            attempt += 1
+            timeout: float = DELETE_TIMEOUT_SECONDS
+            if shutdown.requested():
+                left = shutdown.remaining()
+                if left <= 0:
+                    raise TimeoutError("shutdown budget spent")
+                timeout = min(SHUTDOWN_DELETE_TIMEOUT_SECONDS, left)
             try:
-                resp = self._session.delete(
-                    url, headers=self._headers(), timeout=timeout or HTTP_TIMEOUT_SECONDS
-                )
+                resp = self._session.delete(url, headers=self._headers(), timeout=timeout)
                 if resp.status_code == 404:
                     return
                 resp.raise_for_status()
                 return
             except Exception:
-                if attempt == attempts:
+                if attempt >= DELETE_ATTEMPTS or shutdown.requested():
                     raise
                 self._sleep(attempt)
 
@@ -229,6 +254,9 @@ class SignalClient:
             ws = None
             try:
                 ws = self._ws_connect(self.receive_url(), headers)
+                self._current_ws = ws
+                if should_stop():  # stop requested while connecting
+                    break
                 logger.info("Receive stream connected")
                 self._beat()
                 delay = RECONNECT_MIN_SECONDS
@@ -250,19 +278,53 @@ class SignalClient:
                     if msg is not None:
                         frames.put(msg)
             except Exception as e:
+                if should_stop():  # closed on purpose at shutdown
+                    break
                 logger.warning("Receive stream error (type: %s); reconnecting in %ss",
                                type(e).__name__, delay)
                 logger.debug("Receive stream error detail: %s", e)
-                if should_stop():
-                    break
                 self._sleep(delay)
                 delay = min(delay * 2, RECONNECT_MAX_SECONDS)
             finally:
+                self._current_ws = None
                 if ws is not None:
                     try:
                         ws.close()
                     except Exception:
                         pass
+
+    def _stop_reader(self, reader: threading.Thread, stop_reader: threading.Event,
+                     frames: "queue.Queue[dict]") -> list[dict]:
+        """Stop the reader for good and return every frame it delivered.
+
+        Closing the connection means no new frame can be read; draining while
+        waiting lets a reader blocked on a full queue finish its hand-over. A
+        final drain after it has exited catches the last frame it put.
+        """
+        stop_reader.set()
+        ws = self._current_ws
+        if ws is not None:
+            try:
+                ws.abort()
+            except Exception:
+                pass
+        pending: list[dict] = []
+
+        def drain() -> None:
+            while True:
+                try:
+                    pending.append(frames.get_nowait())
+                except queue.Empty:
+                    return
+
+        deadline = time.monotonic() + READER_STOP_SECONDS
+        while reader.is_alive() and time.monotonic() < deadline:
+            drain()
+            reader.join(0.05)
+        drain()
+        if reader.is_alive():
+            logger.warning("Receive thread did not stop in time; frames may be lost")
+        return pending
 
     def receive_forever(
         self,
@@ -278,9 +340,11 @@ class SignalClient:
         (they may carry document content) and never stop the loop.
 
         On shutdown (SystemExit / KeyboardInterrupt) the reader is stopped and
-        every frame still queued is handed to ``on_shutdown`` before the
-        exception propagates: signal-cli does not redeliver them, so this is
-        the last chance to delete their attachments.
+        every frame it delivered but that was not fully handled, including the
+        one in flight, is handed to ``on_shutdown`` before the exception
+        propagates: signal-cli does not redeliver them, so this is the last
+        chance to delete their attachments. Further signals are postponed until
+        that is done (``shutdown.deferred``).
         """
         frames: queue.Queue[dict] = queue.Queue(maxsize=RECEIVE_QUEUE_SIZE)
         stop_reader = threading.Event()
@@ -291,26 +355,25 @@ class SignalClient:
             daemon=True,
         )
         reader.start()
+        in_flight: dict | None = None
         try:
             while not should_stop():
                 try:
-                    msg = frames.get(timeout=1)
+                    in_flight = frames.get(timeout=1)
                 except queue.Empty:
                     if not reader.is_alive() and not should_stop():
                         raise RuntimeError("receive thread stopped")
                     continue
                 try:
-                    on_message(msg)
+                    on_message(in_flight)
                 except Exception as e:
                     logger.error("Message handler failed (type: %s)", type(e).__name__)
+                in_flight = None
         except (SystemExit, KeyboardInterrupt):
-            stop_reader.set()
-            pending: list[dict] = []
-            while True:
-                try:
-                    pending.append(frames.get_nowait())
-                except queue.Empty:
-                    break
-            if on_shutdown is not None and pending:
-                on_shutdown(pending)
+            with shutdown.deferred():
+                pending = self._stop_reader(reader, stop_reader, frames)
+                if in_flight is not None:
+                    pending.insert(0, in_flight)
+                if on_shutdown is not None and pending:
+                    on_shutdown(pending)
             raise

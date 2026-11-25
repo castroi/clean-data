@@ -18,6 +18,7 @@ def main() -> None:
     # interrupted: the exit is postponed until they finish (see shutdown.py),
     # and files of messages still queued are deleted before exiting.
     signal.signal(signal.SIGTERM, shutdown.request)
+    signal.signal(signal.SIGINT, shutdown.request)  # Ctrl-C: same graceful path
     config = Config()
     bot = SignalBot(config)
     bot.start()

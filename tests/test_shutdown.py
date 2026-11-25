@@ -47,3 +47,17 @@ def test_budget_counts_down(monkeypatch):
     with pytest.raises(SystemExit):
         shutdown.request()
     assert 19.0 < shutdown.remaining() <= 20.0
+
+
+def test_repeat_request_is_ignored():
+    with pytest.raises(SystemExit):
+        shutdown.request()
+    shutdown.request()  # second SIGTERM while already exiting: no new SystemExit
+    assert shutdown.requested()
+
+
+def test_repeat_request_inside_deferred_still_one_exit():
+    with pytest.raises(SystemExit):
+        with shutdown.deferred():
+            shutdown.request()
+            shutdown.request()

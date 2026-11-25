@@ -22,9 +22,6 @@ RATE_LIMIT_WINDOW_SECONDS = 60
 # ignored silently (attachments are still deleted from signal-cli).
 RATE_LIMIT_MAX_MESSAGES = 20
 
-# Per-delete limits once shutdown has started (all must fit the shutdown budget).
-SHUTDOWN_DELETE_TIMEOUT_SECONDS = 5.0
-
 DONE_MESSAGE = (
     "Done. Your original has been deleted from the server, and this cleaned "
     "copy is deleted right after sending."
@@ -138,19 +135,13 @@ class SignalBot:
     def _delete_original(self, attachment_id: str) -> bool:
         """Delete one received file from signal-cli. Returns True if it is gone.
 
-        Once shutdown has started, one short attempt each, and nothing after
-        the shutdown budget is spent (the container is about to be killed).
+        During shutdown the transport makes single short attempts within the
+        shutdown budget (see SignalClient.delete_attachment).
         """
         try:
-            if shutdown.requested():
-                left = shutdown.remaining()
-                if left <= 0:
-                    return False
-                self._api.delete_attachment(
-                    attachment_id, timeout=min(SHUTDOWN_DELETE_TIMEOUT_SECONDS, left), attempts=1
-                )
-            else:
-                self._api.delete_attachment(attachment_id)
+            self._api.delete_attachment(attachment_id)
+        except TimeoutError:
+            return False  # shutdown budget spent; counted by the caller
         except Exception as e:
             logger.error("Failed to delete attachment from signal-cli (type: %s)", type(e).__name__)
             return False
@@ -373,29 +364,35 @@ class SignalBot:
         finally:
             # A SIGTERM arriving here is postponed until every id was tried.
             with shutdown.deferred():
-                for attachment_id in ids - self._deleted_ids:
-                    self._delete_original(attachment_id)
+                left_behind = sum(
+                    not self._delete_original(attachment_id) for attachment_id in ids - self._deleted_ids
+                )
+                if left_behind:
+                    logger.error("%d attachment(s) of this message left in signal-cli", left_behind)
 
     def on_shutdown(self, frames: list[dict]) -> None:
-        """Delete the attachments of frames still queued at shutdown.
+        """Delete the attachments of frames not fully handled at shutdown.
 
-        signal-cli does not redeliver them, so without this their files would
-        stay in its store for good. They are not processed or answered.
+        ``frames`` are the queued ones plus the one in flight. signal-cli does
+        not redeliver them, so without this their files would stay in its
+        store for good. They are not processed or answered. Ids of the
+        in-flight frame that were already deleted are skipped.
         """
-        ids: set[str] = set()
-        for msg in frames:
-            ids |= frame_attachment_ids(msg)
-        if not ids:
-            return
-        deleted = 0
         with shutdown.deferred():
-            for attachment_id in ids:
-                if self._delete_original(attachment_id):
-                    deleted += 1
-        logger.warning(
-            "Shutdown: deleted %d of %d attachment(s) from %d unprocessed message(s)",
-            deleted, len(ids), len(frames),
-        )
+            ids: set[str] = set()
+            for msg in frames:
+                ids |= frame_attachment_ids(msg)
+            ids -= self._deleted_ids
+            if not ids:
+                return
+            deleted = sum(self._delete_original(attachment_id) for attachment_id in ids)
+            # Logged inside the block: on a real SIGTERM the block ends in
+            # SystemExit, so a line after it would never be written.
+            log = logger.warning if deleted == len(ids) else logger.error
+            log(
+                "Shutdown: deleted %d of %d attachment(s) from %d unhandled message(s); %d left in signal-cli",
+                deleted, len(ids), len(frames), len(ids) - deleted,
+            )
 
     def start(self) -> None:
         """Listen for incoming Signal messages on the wrapper's receive stream."""

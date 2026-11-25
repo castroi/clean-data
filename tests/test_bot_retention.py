@@ -314,9 +314,6 @@ def test_sigterm_during_sweep_still_deletes_every_file(tmp_path):
     with pytest.raises(SystemExit):
         bot.on_receive(_frame({"message": "links", "previews": _previews("p1", "p2", "p3")}))
     assert sorted(c[0] for c in calls) == ["p1", "p2", "p3"]
-    # after the request, deletes are single short attempts
-    for _, kwargs in calls[1:]:
-        assert kwargs["attempts"] == 1 and kwargs["timeout"] <= signal_bot.SHUTDOWN_DELETE_TIMEOUT_SECONDS
 
 
 def test_sigterm_during_processing_then_sweep_completes(tmp_path):
@@ -335,14 +332,13 @@ def test_sigterm_during_processing_then_sweep_completes(tmp_path):
     assert list((tmp_path / "temp").iterdir()) == []
 
 
-def test_shutdown_budget_spent_skips_remaining_deletes(tmp_path, monkeypatch):
+def test_budget_spent_is_counted_not_logged_per_id(tmp_path, caplog):
     bot = _bot(tmp_path)
-    monkeypatch.setattr(shutdown, "SHUTDOWN_BUDGET_SECONDS", 0.0)
-    with shutdown.deferred():
-        shutdown.request()
-        assert bot._delete_original("x") is False
-        bot._api.delete_attachment.assert_not_called()
-        shutdown.reset()  # leave the block without exiting the test
+    bot._api.delete_attachment.side_effect = TimeoutError("shutdown budget spent")
+    with caplog.at_level(logging.INFO):
+        bot.on_shutdown([_frame({"message": "x", "previews": _previews("a", "b")})])
+    assert "deleted 0 of 2 attachment(s) from 1 unhandled message(s); 2 left in signal-cli" in caplog.text
+    assert "Failed to delete" not in caplog.text
 
 
 def test_on_shutdown_deletes_files_of_queued_frames(tmp_path, caplog):
@@ -359,7 +355,7 @@ def test_on_shutdown_deletes_files_of_queued_frames(tmp_path, caplog):
     assert sorted(_deleted(bot)) == ["q1", "q2", "q3"]
     bot._api.send_message.assert_not_called()   # not processed or answered
     bot._api.get_attachment.assert_not_called()
-    assert "deleted 3 of 3 attachment(s) from 4 unprocessed message(s)" in caplog.text
+    assert "deleted 3 of 3 attachment(s) from 4 unhandled message(s); 0 left in signal-cli" in caplog.text
     assert "q1" not in caplog.text and "John" not in caplog.text and SENDER not in caplog.text
 
 
@@ -376,3 +372,49 @@ def test_sigterm_during_on_shutdown_does_not_cut_it_short(tmp_path):
     with pytest.raises(SystemExit):
         bot.on_shutdown([_frame({"message": "x", "previews": _previews("a", "b", "c")})])
     assert sorted(calls) == ["a", "b", "c"]
+
+
+def test_shutdown_summary_logged_on_real_sigterm(tmp_path, caplog):
+    """Finding 4: the count line must survive the SystemExit that ends the block."""
+    bot = _bot(tmp_path)
+
+    def delete(attachment_id):
+        if attachment_id == "b":
+            os.kill(os.getpid(), signal.SIGTERM)
+
+    bot._api.delete_attachment.side_effect = delete
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(SystemExit):
+            bot.on_shutdown([_frame({"message": "x", "previews": _previews("a", "b", "c")})])
+    assert "deleted 3 of 3 attachment(s)" in caplog.text
+
+
+def test_on_shutdown_skips_ids_already_deleted_in_flight(tmp_path):
+    """Finding 2: the in-flight frame is passed again; done ids are not redone."""
+    bot = _bot(tmp_path)
+    bot._deleted_ids = {"att1"}
+    bot.on_shutdown([_frame({"message": "", "attachments": [_att("att1")], "previews": _previews("p1")})])
+    assert _deleted(bot) == ["p1"]
+
+
+def test_second_sigterm_during_shutdown_is_ignored(tmp_path):
+    """Finding 5: a repeat signal (or Ctrl-C) cannot cut the cleanup short."""
+    bot = _bot(tmp_path)
+    calls = []
+
+    def delete(attachment_id):
+        calls.append(attachment_id)
+        os.kill(os.getpid(), signal.SIGTERM)  # every delete gets another SIGTERM
+
+    bot._api.delete_attachment.side_effect = delete
+    with pytest.raises(SystemExit):
+        bot.on_shutdown([_frame({"message": "x", "previews": _previews("a", "b", "c", "d")})])
+    assert sorted(calls) == ["a", "b", "c", "d"]
+
+
+def test_sweep_reports_files_left_behind(tmp_path, caplog):
+    bot = _bot(tmp_path)
+    bot._api.delete_attachment.side_effect = TimeoutError("shutdown budget spent")
+    with caplog.at_level(logging.ERROR):
+        bot.on_receive(_frame({"message": "x", "previews": _previews("a", "b")}))
+    assert "2 attachment(s) of this message left in signal-cli" in caplog.text
