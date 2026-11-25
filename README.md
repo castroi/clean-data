@@ -22,14 +22,15 @@ A privacy-first document sanitization tool. Users send PDF or DOCX files via a S
 | spaCy en_core_web_sm | English NLP |
 | PyMuPDF | PDF processing |
 | python-docx | DOCX processing |
-| signal-cli REST API | Signal bot integration |
+| signal-cli REST API via [signal-wrapper](https://github.com/castroi/signal-wrapper) | Signal bot integration |
 | pytest | Testing |
 
 ## Architecture
 
 ```
 main.py → SignalBot → CleaningPipeline → PDFCleaner / DOCXCleaner → PIIDetector
-                                       → secure_delete (cleanup)
+             │                         → secure_delete (cleanup)
+             └→ SignalClient → wrapper-clean-data → shared signal-cli
 ```
 
 ### Key Modules
@@ -75,9 +76,9 @@ TMPDIR=~/tmp pip install --no-cache-dir -r requirements.txt
 python3 -m spacy download en_core_web_sm
 ```
 
-### 5. Configure signal-cli
+### 5. Configure Signal access
 
-Install and configure the [signal-cli REST API](https://github.com/bbernhard/signal-cli-rest-api) with a registered phone number.
+The bot talks to Signal only through its own [signal-wrapper](https://github.com/castroi/signal-wrapper), which sits in front of a [signal-cli REST API](https://github.com/bbernhard/signal-cli-rest-api) container running `MODE=json-rpc` with the bot's number registered. The wrapper must run with `ALLOW_ATTACHMENTS=true` and a token. Point `SIGNAL_API_URL` at the wrapper and set `SIGNAL_TOKEN` (or `SIGNAL_TOKEN_FILE`) to the wrapper's token.
 
 ### 6. Configure environment variables
 
@@ -105,11 +106,17 @@ python3 main.py
 cp .env.example .env
 ```
 
-Edit `.env` and set `SIGNAL_PHONE_NUMBER` to the phone number you will register. `SIGNAL_CLI_URL` and `TEMP_DIR` are set automatically by Docker Compose.
+Edit `.env`: set `SIGNAL_PHONE_NUMBER` to the bot's number, `SIGNAL_BACKEND_URL` to the shared signal-cli on the `signal-net` network, and `ALLOWED_SENDERS` to the Signal UUIDs allowed to use the bot (required; `.env.example` explains how to find a UUID). `SIGNAL_API_URL`, `SIGNAL_TOKEN_FILE`, `TEMP_DIR` and the send limit are fixed in `docker-compose.yml`, which passes only the variables it lists into the containers.
+
+Create the token shared by the bot and its wrapper (never put it in `.env`):
+
+```bash
+mkdir -p secrets && openssl rand -hex 32 > secrets/signal_token && sudo chgrp 10001 secrets/signal_token && chmod 640 secrets/signal_token
+```
 
 ### 2. Register your Signal number (one-time)
 
-Follow the detailed instructions in the **"Set up a phone number"** section below to register and verify your Signal number. The phone number must match the `SIGNAL_PHONE_NUMBER` in your `.env` file — the clean-data bot uses it to poll the signal-cli REST API for incoming messages.
+Register the number on the **shared** signal-cli container (`MODE=json-rpc`), not through the wrapper, which blocks registration by design. See **"Set up a phone number"** below. The number must match `SIGNAL_PHONE_NUMBER`.
 
 ### 3. Start
 
@@ -125,9 +132,9 @@ View the bot logs to monitor processing and troubleshoot errors:
 docker logs clean-data-clean-data-1
 ```
 
-View the signal-cli logs to check message delivery and API requests (use `--tail` to limit output):
+View the wrapper logs to check send/receive and denied requests (use `--tail` to limit output):
 ```bash
-docker logs clean-data-signal-cli-1 --tail 10
+docker logs clean-data-wrapper-clean-data-1 --tail 10
 ```
 
 ### 5. Stop
@@ -138,10 +145,11 @@ docker compose down
 
 ### Docker Notes
 
-- **signal-cli data** persists in a Docker named volume (`signal-data`). Your registration survives container restarts.
+- **signal-cli** is shared and runs outside this project. Its registration and data are managed there.
+- **Received files** are deleted from signal-cli's storage through the wrapper (`DELETE /v1/attachments/{id}`) after every message, whether it was processed or rejected.
 - **Temp files** are stored on a `tmpfs` mount and are lost on restart — this is by design for maximum PII protection.
 - **NLP models** are baked into the Docker image at build time. No internet access is needed at runtime.
-- The signal-cli port is **not exposed to the host** — communication happens over an internal Docker network.
+- No ports are published. clean-data reaches only its wrapper; only the wrapper is on `signal-net`.
 
 ## Configuration
 
@@ -150,11 +158,16 @@ All configuration is done via environment variables or a `.env` file.
 | Variable | Description | Default |
 |---|---|---|
 | `SIGNAL_PHONE_NUMBER` | Bot's registered Signal phone number | required |
-| `SIGNAL_CLI_URL` | signal-cli REST API URL | `http://localhost:8080` |
+| `SIGNAL_API_URL` | This bot's signal-wrapper URL | `http://localhost:8080` |
+| `SIGNAL_TOKEN_FILE` | File holding the wrapper bearer token (Docker secret) | (unset) |
+| `SIGNAL_TOKEN` | Token fallback when no file is set (local/testing) | (unset) |
+| `SIGNAL_BACKEND_URL` | Shared signal-cli URL, used by the wrapper (compose only) | `http://signal-api:8080` |
 | `TEMP_DIR` | Temporary file directory | `/tmp/clean-data` |
 | `MAX_FILE_SIZE_MB` | Maximum accepted file size in MB | `25` |
 | `PROCESSING_TIMEOUT` | Maximum processing time in seconds | `300` |
-| `ALLOWED_SENDERS` | Comma-separated allowlist of Signal UUIDs | (all senders allowed) |
+| `ALLOWED_SENDERS` | **Required.** Comma-separated allowlist of Signal UUIDs (not phone numbers). Missing, empty or any invalid entry stops startup | — |
+| `SIGNAL_MAX_SEND_BYTES` | Largest send body the wrapper accepts (its `MAX_BODY_BYTES`); bigger cleaned files are not sent and the user is told | `40000000` |
+| `HEARTBEAT_FILE` | File touched on every frame/pong from the receive stream; used by the Docker healthcheck | (unset) |
 | `WORD_SESSION_TTL_SECONDS` | TTL for `/replace` custom word sessions | `3600` (1 hour) |
 | `MAX_WORDS_PER_SENDER` | Maximum custom words per `/replace` session | `15` |
 | `MAX_WORD_LENGTH` | Maximum length per custom word | `100` |
@@ -197,29 +210,29 @@ Bot:  Custom words cleared. Back to automatic PII detection.
 ## Docker Architecture
 
 ```
-┌─────────────────────────┐       ┌─────────────────────────┐
-│  signal-cli container   │       │  clean-data container   │
-│  (REST API on :8080)    │◄──────│  (Python bot + NLP)     │
-│                         │       │  Presidio, spaCy,       │
-│  bbernhard/             │       │  PyMuPDF, python-docx   │
-│  signal-cli-rest-api    │       │  custom Dockerfile      │
-└─────────────────────────┘       └─────────────────────────┘
-         │                                   │
-         ▼                                   ▼
-   signal-data volume               tmpfs /tmp/clean-data
-   (Signal credentials)             (PII files, never on disk)
+            signal-net (shared)                     cleandatanet (private)
+┌──────────────────────────┐   ┌─────────────────────┐   ┌─────────────────────────┐
+│  shared signal-cli       │◄──│  wrapper-clean-data │◄──│  clean-data container   │
+│  bbernhard/              │   │  castroi/           │   │  (Python bot + NLP)     │
+│  signal-cli-rest-api     │   │  signal-wrapper     │   │  Presidio, spaCy,       │
+│  MODE=json-rpc           │   │  pins sender,       │   │  PyMuPDF, python-docx   │
+│  (separate project)      │   │  bearer token       │   │                         │
+└──────────────────────────┘   └─────────────────────┘   └─────────────────────────┘
+                                                                     │
+                                                                     ▼
+                                                          tmpfs /tmp/clean-data
+                                                          (PII files, never on disk)
 ```
 
-Two containers run on an internal Docker bridge network:
+- **shared signal-cli** handles the Signal protocol for all bots. It is not part of this compose file.
+- **wrapper-clean-data** is this bot's own [signal-wrapper](https://github.com/castroi/signal-wrapper). It forces every send to come from `SIGNAL_PHONE_NUMBER`, pins the receive WebSocket to it, requires the bearer token, and exposes only send, receive and (with `ALLOW_ATTACHMENTS=true`) single-attachment download/delete.
+- **clean-data** is built from the project's `Dockerfile`, with all NLP models baked in. It receives messages over the wrapper's WebSocket, downloads each document, cleans it, sends the result back, and deletes the original from signal-cli.
 
-- **signal-cli** uses the official [bbernhard/signal-cli-rest-api](https://github.com/bbernhard/signal-cli-rest-api) image. It handles Signal protocol, message sending/receiving, and attachment storage. Signal credentials are persisted in a named Docker volume.
-- **clean-data** is built from the project's `Dockerfile`. It packages the Python application with all NLP models baked in (no internet needed at runtime). It communicates with signal-cli over the internal network via HTTP REST API.
-
-The signal-cli port is **not exposed to the host** — only the clean-data container can reach it. Temporary files are stored on a `tmpfs` mount, so PII never touches persistent storage.
+Temporary files are stored on a `tmpfs` mount, so PII never touches persistent storage.
 
 ### Useful Docker Commands
 
-Rebuild the clean-data image after code changes (does not affect signal-cli or its registration):
+Rebuild the clean-data image after code changes (does not affect the shared signal-cli or its registration):
 ```bash
 docker compose build clean-data
 ```
@@ -250,7 +263,7 @@ pytest tests/test_signal_bot.py -v
 - All processing is local — documents never leave the machine
 - Files are securely overwritten (random bytes followed by zeros) before deletion
 - Rate limiting: 5 files per 60 seconds per sender
-- Optional sender allowlist restricts access to trusted Signal UUIDs
+- Required sender allowlist of Signal UUIDs: identity is the sender's `sourceUuid` only, unknown senders are dropped silently (no reply, no id logged)
 - Filename sanitization prevents path traversal attacks
 - Stale temporary files are purged on startup
 - No PII is written to logs — exception details are logged at DEBUG level only
@@ -258,7 +271,7 @@ pytest tests/test_signal_bot.py -v
 
 ## Privacy Principles
 
-- **Zero data retention** — all files are deleted immediately after processing
+- **Zero data retention** — all files are deleted immediately after processing, including the copy signal-cli keeps of each received attachment (deleted right after download, and every other attachment in a message — previews, quote thumbnails, edits, stories — when the message is done). On `docker stop`, a delete sweep in progress is finished first; the bot then stops taking messages from signal-cli and deletes the files of every message it had already taken but not finished (without processing them), logging how many were deleted or left behind. Caveats: a hard crash, OOM kill or SIGKILL between download and delete can leave the original in signal-cli, and so can messages that arrive while the bot is down, and files sent to the shared signal-cli's other (text-only) bots are not deleted by anyone (castroi/signal-wrapper#23).
 - **No external API calls** — all NLP models run locally on CPU
 - **No PII in logs** — exception details are logged at DEBUG level only
 - **End-to-end encrypted** — all communication via Signal
@@ -272,6 +285,8 @@ pytest tests/test_signal_bot.py -v
 
 
 ## Set up a phone number
+Run these against the **shared signal-cli container directly** (for example from a container on `signal-net`, or a temporarily published port), never through the wrapper, which blocks `register` by design.
+
 You will need to set up the phone number(s) to send message.In order to do so, make sure, you have `curl` installed on your system. You can then issue the commands shown below from the command line. We use the example server `127.0.0.1` on port `8080`. If you have set up a different server, you will have to change this in the commands.
 
 ### Register a new phone number

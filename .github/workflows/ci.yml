@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # Superseded PR runs are cancelled; every commit on main keeps its result.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # "check" is the status check the main-branch ruleset requires.
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # Actions are pinned to exact commits, so a moved tag can't change what runs here.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11" # same as the image
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      # Same as the Dockerfile: requirements, then the spaCy model.
+      - name: Install
+        run: |
+          python -m pip install -r requirements.txt
+          python -m spacy download en_core_web_sm
+
+      # The real-socket tests skip without websocket-client; make sure they run here.
+      - name: websocket-client present
+        run: python -c "import websocket; print('websocket-client', websocket.__version__)"
+
+      # Known vulnerabilities in what requirements.txt resolves to (what the image installs).
+      - name: Audit dependencies
+        run: |
+          python -m pip install "pip-audit>=2.7,<3"
+          pip-audit -r requirements.txt
+
+      # One file at a time: each loads its own NLP models (see CLAUDE.md).
+      - name: Tests
+        run: |
+          status=0
+          for f in tests/test_*.py; do
+            echo "::group::$f"
+            python -m pytest -q -p no:cacheprovider -W error::pytest.PytestUnhandledThreadExceptionWarning "$f" || status=1
+            echo "::endgroup::"
+          done
+          exit "$status"
+
+      # The compose file resolves with the example .env, and refuses to start
+      # without the required ALLOWED_SENDERS.
+      - name: Compose file
+        run: |
+          cp .env.example .env
+          mkdir -p secrets && echo dummy-token-for-ci > secrets/signal_token
+          docker compose config -q
+          sed -i '/^ALLOWED_SENDERS=/d' .env
+          if docker compose config -q 2>/dev/null; then
+            echo "::error::docker compose config accepted a .env without ALLOWED_SENDERS"
+            exit 1
+          fi

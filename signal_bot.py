@@ -5,11 +5,11 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-from pysignalclirestapi import SignalCliRestApi
-
-from config import Config, parse_allowed_senders
+import shutdown
+from config import Config, load_signal_token, parse_allowed_senders
 from processor.custom_word_detector import CustomWordDetector
-from processor.pipeline import CleaningPipeline, ProcessingTimeout
+from processor.pipeline import CleaningPipeline, ProcessingTimeout, output_path_for
+from signal_client import SignalClient
 from utils.secure_delete import secure_delete, secure_delete_dir
 from word_session_store import WordSessionStore
 
@@ -18,6 +18,18 @@ logger = logging.getLogger(__name__)
 SUPPORTED_EXTENSIONS = {".pdf", ".docx"}
 RATE_LIMIT_MAX_FILES = 5
 RATE_LIMIT_WINDOW_SECONDS = 60
+# Any message (text or file) per sender per window; beyond it, messages are
+# ignored silently (attachments are still deleted from signal-cli).
+RATE_LIMIT_MAX_MESSAGES = 20
+
+DONE_MESSAGE = (
+    "Done. Your original has been deleted from the server, and this cleaned "
+    "copy is deleted right after sending."
+)
+DONE_MESSAGE_NOT_DELETED = (
+    "Done. Note: your original could not be deleted from the Signal relay "
+    "automatically. The operator has been alerted."
+)
 
 USAGE_MESSAGE = (
     "Welcome to Clean-Data! Send me a PDF or DOCX file and I will remove "
@@ -36,19 +48,29 @@ class SignalBot:
 
     def __init__(self, config: Config | None = None) -> None:
         self._config = config or Config()
-        self._api = SignalCliRestApi(
-            base_url=self._config.SIGNAL_CLI_URL,
+        self._api = SignalClient(
+            base_url=self._config.SIGNAL_API_URL,
             number=self._config.SIGNAL_PHONE_NUMBER,
+            token=load_signal_token(self._config),
+            heartbeat_path=Path(self._config.HEARTBEAT_FILE) if self._config.HEARTBEAT_FILE else None,
         )
         self._pipeline = CleaningPipeline(self._config)
         self._temp_dir = Path(self._config.TEMP_DIR)
         self._temp_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
 
-        # Rate limiting: per-sender timestamps of recent file submissions
+        # Rate limiting: per-sender timestamps of recent file submissions / messages
         self._rate_limits: dict[str, list[float]] = defaultdict(list)
+        self._message_rate_limits: dict[str, list[float]] = defaultdict(list)
 
-        # Optional allowlist: comma-separated phone numbers in env var
+        # Attachment ids of the frame being handled that were already deleted
+        # from signal-cli (so the final sweep doesn't delete them twice).
+        self._deleted_ids: set[str] = set()
+
+        # Required allowlist of Signal UUIDs (ACIs). Missing/invalid stops startup.
         self._allowed_senders: set[str] = parse_allowed_senders(self._config.ALLOWED_SENDERS)
+        # Rejections are logged at most once per window, as a count, never an id.
+        self._rejected_since_log = 0
+        self._last_reject_log = 0.0
 
         # Per-sender custom word sessions for /replace command
         self._word_store = WordSessionStore(
@@ -58,37 +80,73 @@ class SignalBot:
             max_sessions=self._config.MAX_WORD_SESSIONS,
         )
 
-    def _is_rate_limited(self, sender: str) -> bool:
-        """Check if sender has exceeded the rate limit."""
+    @staticmethod
+    def _hit(limits: dict[str, list[float]], sender: str, max_hits: int) -> bool:
+        """Record a hit for sender; return True if over max_hits in the window."""
         now = time.time()
         # Prune old timestamps outside the window
-        self._rate_limits[sender] = [
-            t for t in self._rate_limits[sender]
-            if now - t < RATE_LIMIT_WINDOW_SECONDS
-        ]
-        if len(self._rate_limits[sender]) >= RATE_LIMIT_MAX_FILES:
+        limits[sender] = [t for t in limits[sender] if now - t < RATE_LIMIT_WINDOW_SECONDS]
+        if len(limits[sender]) >= max_hits:
             return True
-        self._rate_limits[sender].append(now)
+        limits[sender].append(now)
         return False
+
+    def _log_rejection(self) -> None:
+        self._rejected_since_log += 1
+        now = time.time()
+        if now - self._last_reject_log >= RATE_LIMIT_WINDOW_SECONDS:
+            logger.warning("Dropped %d message(s) from senders not in ALLOWED_SENDERS", self._rejected_since_log)
+            self._rejected_since_log = 0
+            self._last_reject_log = now
+
+    def _is_rate_limited(self, sender: str) -> bool:
+        """Check if sender has exceeded the file rate limit."""
+        return self._hit(self._rate_limits, sender, RATE_LIMIT_MAX_FILES)
 
     def _send_message(self, recipient: str, message: str) -> None:
         """Send a text message to a Signal recipient."""
         try:
             self._api.send_message(message=message, recipients=[recipient])
         except Exception as e:
-            logger.error("Failed to send message: %s", e)
+            logger.error("Failed to send message (type: %s)", type(e).__name__)
+            logger.debug("Send error detail: %s", e)
 
-    def _send_attachment(self, recipient: str, file_path: Path, message: str = "") -> None:
-        """Send a file attachment to a Signal recipient."""
+    def _send_attachment(self, recipient: str, file_path: Path, message: str = "") -> bool:
+        """Send a file attachment to a Signal recipient. Returns True on success."""
         try:
             file_bytes = file_path.read_bytes()
+            # Generic name: the original filename may itself contain PII.
             self._api.send_message(
                 message=message,
                 recipients=[recipient],
-                attachments_as_bytes=[file_bytes],
+                attachments=[(f"cleaned{file_path.suffix.lower()}", file_bytes)],
             )
+            return True
         except Exception as e:
-            logger.error("Failed to send attachment: %s", e)
+            logger.error("Failed to send attachment (type: %s)", type(e).__name__)
+            logger.debug("Send error detail: %s", e)
+            return False
+
+    def _fits_send_limit(self, size: int) -> bool:
+        """Whether a file of ``size`` bytes fits the wrapper's send body cap as base64."""
+        encoded = 4 * ((size + 2) // 3)
+        return encoded + 1024 <= self._config.SIGNAL_MAX_SEND_BYTES
+
+    def _delete_original(self, attachment_id: str) -> bool:
+        """Delete one received file from signal-cli. Returns True if it is gone.
+
+        During shutdown the transport makes single short attempts within the
+        shutdown budget (see SignalClient.delete_attachment).
+        """
+        try:
+            self._api.delete_attachment(attachment_id)
+        except TimeoutError:
+            return False  # shutdown budget spent; counted by the caller
+        except Exception as e:
+            logger.error("Failed to delete attachment from signal-cli (type: %s)", type(e).__name__)
+            return False
+        self._deleted_ids.add(attachment_id)
+        return True
 
     def _get_file_extension(self, filename: str) -> str:
         """Extract and normalize file extension."""
@@ -102,9 +160,15 @@ class SignalBot:
             message: The text content of the message.
             attachments: List of attachment dicts with 'filename', 'id', 'size' keys.
         """
-        # Allowlist check (if configured)
-        if self._allowed_senders and sender.lower() not in self._allowed_senders:
-            logger.warning("Rejected message from unauthorized sender: %s", sender)
+        # Allowlist first. Unknown senders are dropped silently: no reply, no id
+        # or message logged, only a rate-limited count.
+        if sender.lower() not in self._allowed_senders:
+            self._log_rejection()
+            return
+
+        # Flood guard for any message (text or file); ignored silently.
+        if self._hit(self._message_rate_limits, sender, RATE_LIMIT_MAX_MESSAGES):
+            logger.warning("Message rate limit exceeded; message ignored")
             return
 
         # Command handling — must happen before attachment check
@@ -174,24 +238,26 @@ class SignalBot:
         # Acknowledge
         self._send_message(sender, "Processing your document...")
 
-        # Sanitize filename: strip path components to prevent traversal
-        safe_name = Path(filename).name.replace("/", "").replace("\\", "").replace("\x00", "")
-        if not safe_name:
-            safe_name = f"attachment{ext}"
-        random_id = secrets.token_hex(8)
-        input_path = self._temp_dir / f"input_{random_id}_{safe_name}"
+        # Temp name from a random token + the validated extension only: the
+        # user's filename (which may itself contain PII) never touches disk or
+        # logs, and cannot cause path traversal or over-long names.
+        input_path = self._temp_dir / f"input_{secrets.token_hex(8)}{ext}"
 
         # Verify path is still within temp dir
         if not input_path.resolve().is_relative_to(self._temp_dir.resolve()):
             self._send_message(sender, "Invalid filename.")
             return
         cleaned_path = None
+        original_deleted = True
 
         try:
             # Download attachment from signal-cli REST API
             attachment_id = attachment.get("id")
             if attachment_id:
-                content = self._api.get_attachment(attachment_id)
+                content = self._api.get_attachment(attachment_id, max_bytes)
+                # Remove the original from signal-cli as soon as we hold it,
+                # before the (long) processing step.
+                original_deleted = self._delete_original(attachment_id)
             else:
                 content = attachment.get("data", b"")
                 if isinstance(content, str):
@@ -215,12 +281,24 @@ class SignalBot:
             # Process
             cleaned_path = self._pipeline.process(input_path, detector=detector)
 
-            # Send back
-            self._send_attachment(
+            # Send back (only if it fits the wrapper's body cap)
+            size = cleaned_path.stat().st_size
+            if not self._fits_send_limit(size):
+                self._send_message(
+                    sender,
+                    f"The cleaned file is too large to send back over Signal "
+                    f"({size // (1024 * 1024)}MB). Please split the document and try again.",
+                )
+                return
+            if not original_deleted:
+                logger.error("Original attachment still in signal-cli after retries")
+            sent = self._send_attachment(
                 sender,
                 cleaned_path,
-                "Done. Original and processed files have been deleted from the server.",
+                DONE_MESSAGE if original_deleted else DONE_MESSAGE_NOT_DELETED,
             )
+            if not sent:
+                self._send_message(sender, "Could not send the cleaned file back. Please try again.")
 
         except ProcessingTimeout:
             logger.error("Processing timed out for attachment")
@@ -237,9 +315,13 @@ class SignalBot:
             self._send_message(sender, "An error occurred while processing your document.")
 
         finally:
-            # Always clean up — even on error
-            paths_to_delete = [p for p in [input_path, cleaned_path] if p and p.exists()]
-            self._pipeline.cleanup(paths_to_delete)
+            # Always clean up — even on error. Include the pipeline's output
+            # path: a timeout/exception can leave a partial cleaned file that
+            # process() never returned.
+            candidates = {input_path, output_path_for(input_path)}
+            if cleaned_path is not None:
+                candidates.add(cleaned_path)
+            self._pipeline.cleanup([p for p in candidates if p.exists()])
 
     def _purge_stale_temp_files(self) -> None:
         """Securely delete any leftover temp files from previous runs."""
@@ -252,40 +334,107 @@ class SignalBot:
                 if item.is_file():
                     secure_delete(item)
 
+    def on_receive(self, msg: dict) -> None:
+        """Handle one frame from the receive stream.
+
+        Every attachment id anywhere in the frame (data, edit, sync and story
+        messages, previews, quote thumbnails, contact avatars, ...) is deleted
+        from signal-cli when the frame is done, whatever happened to it.
+        """
+        ids = frame_attachment_ids(msg)
+        self._deleted_ids = set()
+        try:
+            envelope = msg.get("envelope") or {}
+            data_message = envelope.get("dataMessage") or {}
+            if not isinstance(data_message, dict) or not data_message:
+                return
+
+            # Identity is pinned on the ACI (sourceUuid), never the phone number
+            # (which can be hidden or change). No UUID -> drop.
+            sender = envelope.get("sourceUuid") or ""
+            if not isinstance(sender, str) or not sender:
+                return
+
+            attachments = [a for a in data_message.get("attachments") or [] if isinstance(a, dict)]
+            self.handle_message(
+                sender=sender,
+                message=data_message.get("message") or "",
+                attachments=attachments if attachments else None,
+            )
+        finally:
+            # A SIGTERM arriving here is postponed until every id was tried.
+            with shutdown.deferred():
+                left_behind = sum(
+                    not self._delete_original(attachment_id) for attachment_id in ids - self._deleted_ids
+                )
+                if left_behind:
+                    logger.error("%d attachment(s) of this message left in signal-cli", left_behind)
+
+    def on_shutdown(self, frames: list[dict]) -> None:
+        """Delete the attachments of frames not fully handled at shutdown.
+
+        ``frames`` are the queued ones plus the one in flight. signal-cli does
+        not redeliver them, so without this their files would stay in its
+        store for good. They are not processed or answered. Ids of the
+        in-flight frame that were already deleted are skipped.
+        """
+        with shutdown.deferred():
+            ids: set[str] = set()
+            for msg in frames:
+                ids |= frame_attachment_ids(msg)
+            ids -= self._deleted_ids
+            if not ids:
+                return
+            deleted = sum(self._delete_original(attachment_id) for attachment_id in ids)
+            # Logged inside the block: on a real SIGTERM the block ends in
+            # SystemExit, so a line after it would never be written.
+            log = logger.warning if deleted == len(ids) else logger.error
+            log(
+                "Shutdown: deleted %d of %d attachment(s) from %d unhandled message(s); %d left in signal-cli",
+                deleted, len(ids), len(frames), len(ids) - deleted,
+            )
+
     def start(self) -> None:
-        """Start polling for incoming Signal messages."""
+        """Listen for incoming Signal messages on the wrapper's receive stream."""
         self._purge_stale_temp_files()
         logger.info("Clean-Data bot started on %s", self._config.SIGNAL_PHONE_NUMBER)
-        logger.info("Polling for messages...")
+        try:
+            self._api.receive_forever(self.on_receive, on_shutdown=self.on_shutdown)
+        except (KeyboardInterrupt, SystemExit):
+            logger.info("Bot stopped")
 
-        while True:
-            try:
-                messages = self._api.receive()
-                for msg in messages:
-                    envelope = msg.get("envelope", {})
-                    account = msg.get("account", "")
-                    data_message = envelope.get("dataMessage", {})
 
-                    if not account or not data_message:
-                        continue
+def frame_attachment_ids(msg: dict) -> set[str]:
+    """All attachment ids in a receive frame: every attachment-shaped object,
+    plus anything listed in dataMessage.attachments even if fields are missing.
+    """
+    ids = collect_attachment_ids(msg)
+    envelope = msg.get("envelope") if isinstance(msg, dict) else None
+    data_message = envelope.get("dataMessage") if isinstance(envelope, dict) else None
+    if isinstance(data_message, dict):
+        for a in data_message.get("attachments") or []:
+            if isinstance(a, dict) and isinstance(a.get("id"), str) and a["id"]:
+                ids.add(a["id"])
+    return ids
 
-                    sender = envelope.get("sourceUuid") or envelope.get("sourceNumber") or ""
-                    if not sender:
-                        logger.warning("Message with no sender identifier, skipping")
-                        continue
 
-                    text = data_message.get("message", "")
-                    attachments = data_message.get("attachments", [])
+def collect_attachment_ids(obj: object, _depth: int = 0) -> set[str]:
+    """Return the id of every attachment-shaped object anywhere in ``obj``.
 
-                    self.handle_message(
-                        sender=sender,
-                        message=text,
-                        attachments=attachments if attachments else None,
-                    )
-            except KeyboardInterrupt:
-                logger.info("Bot stopped by user")
-                break
-            except Exception as e:
-                logger.error("Error polling messages: %s", e)
-
-            time.sleep(2)
+    signal-cli downloads all of them into its store: dataMessage/editMessage/
+    syncMessage/storyMessage attachments, link-preview images, quote
+    thumbnails, contact avatars and sticker files. An attachment is a dict with
+    a string ``id`` and a ``contentType`` key.
+    """
+    found: set[str] = set()
+    if _depth > 64:
+        return found
+    if isinstance(obj, dict):
+        if isinstance(obj.get("id"), str) and obj["id"] and "contentType" in obj:
+            found.add(obj["id"])
+        for value in obj.values():
+            found |= collect_attachment_ids(value, _depth + 1)
+    elif isinstance(obj, list):
+        for value in obj:
+            found |= collect_attachment_ids(value, _depth + 1)
+    return found

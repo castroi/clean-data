@@ -1,44 +1,112 @@
-services:
-  signal-cli:
-    image: bbernhard/signal-cli-rest-api:latest
-    restart: unless-stopped
-    environment:
-      - MODE=normal
-    ports:
-      - "8080:8080" # map docker port 8080 to host port 8080.
-    volumes:
-      - "./signal-cli-config:/home/.local/share/signal-cli" # map "signal-cli-config" folder on host system into docker container. the folder contains the password and cryptographic keys when a new number is registered
-    networks:
-      - clean-data-net
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8080/v1/about"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
+# clean-data talks to the SHARED signal-cli only through its own per-bot
+# signal-wrapper (https://github.com/castroi/signal-wrapper). The wrapper pins
+# the sender and receive stream to SIGNAL_PHONE_NUMBER, and is the only service
+# on signal-net. clean-data sits on a private bridge with its wrapper and
+# nothing else. No published ports.
+#
+# Prerequisites (once):
+#   - the shared signal-cli (bbernhard/signal-cli-rest-api, MODE=json-rpc) is
+#     running on the external `signal-net` network with this bot's number
+#     registered on it
+#   - the token file, readable by both containers through a shared group (the
+#     wrapper runs as uid 65532, clean-data as uid 1000; both get gid 10001):
+#       mkdir -p secrets && openssl rand -hex 32 > secrets/signal_token
+#       sudo chgrp 10001 secrets/signal_token && chmod 640 secrets/signal_token
 
-  clean-data:
-    build: .
+# Values shared by both services, set once.
+x-max-send-bytes: &max_send_bytes "40000000"   # wrapper MAX_BODY_BYTES == bot SIGNAL_MAX_SEND_BYTES
+x-logging: &logging                            # bounded logs (SD card on the Pi)
+  driver: json-file
+  options: { max-size: "10m", max-file: "3" }
+
+networks:
+  signal-net: { external: true, name: signal-net }   # the ONE signal-cli's network
+  cleandatanet: { driver: bridge }                    # private: clean-data + its wrapper
+
+secrets:
+  signal_token: { file: ./secrets/signal_token }      # gitignored
+
+services:
+  wrapper-clean-data:
+    # Pinned: signal-wrapper main @ edb82b3 (castroi/signal-wrapper#14, ALLOW_ATTACHMENTS),
+    # linux/arm64 (Raspberry Pi). Bump tag + digest deliberately on wrapper updates.
+    image: ghcr.io/castroi/signal-wrapper:sha-edb82b32e98752aeec0bd2997fdf1c9cb6cae1c4@sha256:1c49d94ec8464c2ad47e10523a44fad55a19692bfebe113fa70d5b8b1c949114
     restart: unless-stopped
-    read_only: true
-    depends_on:
-      signal-cli:
-        condition: service_healthy
-    env_file:
-      - .env
+    init: true
     environment:
-      - SIGNAL_CLI_URL=http://signal-cli:8080
-      - TEMP_DIR=/tmp/clean-data
-    tmpfs:
-      - /tmp/clean-data:size=512M,mode=0700,uid=1000,gid=1000
-      - /tmp:size=64M
-    networks:
-      - clean-data-net
+      BOT_NUMBER: ${SIGNAL_PHONE_NUMBER:?set SIGNAL_PHONE_NUMBER in .env}
+      BACKEND_URL: ${SIGNAL_BACKEND_URL:-http://signal-api:8080}
+      REQUIRE_SEND_AUTH: "true"
+      WS_REQUIRE_AUTH: "true"
+      BOT_TOKEN_FILE: /run/secrets/signal_token
+      # File support: download/delete received documents, send cleaned copies.
+      ALLOW_ATTACHMENTS: "true"
+      MAX_ATTACHMENTS: "1"
+      # Fits a ~28 MB cleaned file as base64 (~4/3) plus JSON.
+      MAX_BODY_BYTES: *max_send_bytes
+      REQUEST_READ_TIMEOUT_SEC: "30"
+      UPSTREAM_TIMEOUT_SEC: "120"   # keep below signal_client.HTTP_TIMEOUT_SECONDS (150)
+      MAX_LARGE_SENDS: "1"          # one file send at a time (the bot is sequential)
+      GOMEMLIMIT: 160MiB            # keep Go's heap under mem_limit
+    secrets: [signal_token]
+    group_add: ["10001"]   # can read secrets/signal_token (mode 640, group 10001)
+    read_only: true
+    user: "65532:65532"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 192m   # needs ~2 x MAX_BODY_BYTES x MAX_LARGE_SENDS + 32m = ~112m (default 32m is text-only)
+    pids_limit: 64
+    networks: [signal-net, cleandatanet]
+    logging: *logging
     healthcheck:
-      test: ["CMD", "python3", "-c", "import os; os.kill(1, 0)"]
+      test: ["CMD", "/signal-wrapper", "healthcheck"]
       interval: 30s
       timeout: 5s
       retries: 3
+
+  clean-data:
+    build: .
+    image: clean-data:local
+    restart: unless-stopped
+    init: true               # forwards docker stop's SIGTERM to the bot
+    stop_grace_period: 30s   # time to delete the in-flight file from signal-cli
+    read_only: true
+    depends_on:
+      wrapper-clean-data:
+        condition: service_healthy
+    # Only these variables reach the container (no env_file: nothing else from
+    # .env leaks in, e.g. a token pasted there by mistake). Required ones make
+    # `docker compose up` fail fast when missing.
+    environment:
+      SIGNAL_PHONE_NUMBER: ${SIGNAL_PHONE_NUMBER:?set SIGNAL_PHONE_NUMBER in .env}
+      ALLOWED_SENDERS: ${ALLOWED_SENDERS:?set ALLOWED_SENDERS (Signal UUIDs) in .env}
+      MAX_FILE_SIZE_MB: ${MAX_FILE_SIZE_MB:-25}
+      PROCESSING_TIMEOUT: ${PROCESSING_TIMEOUT:-300}
+      WORD_SESSION_TTL_SECONDS: ${WORD_SESSION_TTL_SECONDS:-3600}
+      MAX_WORDS_PER_SENDER: ${MAX_WORDS_PER_SENDER:-15}
+      MAX_WORD_LENGTH: ${MAX_WORD_LENGTH:-100}
+      MAX_WORD_SESSIONS: ${MAX_WORD_SESSIONS:-100}
+      # Fixed by this deployment:
+      SIGNAL_API_URL: http://wrapper-clean-data:8080
+      SIGNAL_TOKEN_FILE: /run/secrets/signal_token
+      TEMP_DIR: /tmp/clean-data
+      SIGNAL_MAX_SEND_BYTES: *max_send_bytes
+      HEARTBEAT_FILE: /tmp/heartbeat   # touched on every frame/pong from the wrapper
+    secrets: [signal_token]
+    group_add: ["10001"]
+    tmpfs:
+      - /tmp/clean-data:size=512M,mode=0700,uid=1000,gid=1000
+      - /tmp:size=64M
+    networks: [cleandatanet]   # only its wrapper; never signal-net
+    logging: *logging
+    healthcheck:
+      # Healthy only while the receive stream is alive: the reader pings every
+      # 30 s and touches the heartbeat on each frame or pong.
+      test: ["CMD", "python3", "-c", "import os,sys,time; sys.exit(0 if time.time() - os.path.getmtime('/tmp/heartbeat') < 120 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
     cap_drop:
       - ALL
     security_opt:
@@ -46,10 +114,3 @@ services:
     mem_limit: 2g
     cpus: "2.0"
     pids_limit: 100
-
-volumes:
-  signal-data:
-
-networks:
-  clean-data-net:
-    driver: bridge
