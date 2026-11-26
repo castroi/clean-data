@@ -28,9 +28,9 @@ secrets:
 
 services:
   wrapper-clean-data:
-    # Pinned: signal-wrapper main @ edb82b3 (castroi/signal-wrapper#14, ALLOW_ATTACHMENTS),
-    # linux/arm64 (Raspberry Pi). Bump tag + digest deliberately on wrapper updates.
-    image: ghcr.io/castroi/signal-wrapper:sha-edb82b32e98752aeec0bd2997fdf1c9cb6cae1c4@sha256:1c49d94ec8464c2ad47e10523a44fad55a19692bfebe113fa70d5b8b1c949114
+    # Pinned: signal-wrapper main @ 7824421 (castroi/signal-wrapper#24, multi-arch index:
+    # linux/amd64 + linux/arm64). Bump tag + digest deliberately on wrapper updates.
+    image: ghcr.io/castroi/signal-wrapper:sha-782442124fea8998996a0d3d77e45d4156e1833a@sha256:1711ced1fc6d5808e8a2f8070f6d7d010b13ebbca8e492e7aa831725d8247373
     restart: unless-stopped
     init: true
     environment:
