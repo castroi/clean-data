@@ -82,7 +82,7 @@ main.py → SignalBot → CleaningPipeline → PDFCleaner / DOCXCleaner → PIID
 ```
 
 - **`signal_client.py`** — All Signal transport: receive WebSocket (reconnect with backoff, json-rpc frames), `/v2/send` with bearer token and no `number`, attachment download (size-capped) and delete. `session`/`ws_connect` injectable for tests.
-- **`signal_bot.py`** — Signal bot listener. Receives file attachments, dispatches to pipeline, sends back cleaned files. All error paths must still delete the original file. Includes rate limiting, sender allowlist, filename sanitization, and startup temp file purge.
+- **`signal_bot.py`** — Signal bot listener. Receives file attachments, dispatches to pipeline, sends back cleaned files. All error paths must still delete the original file. Includes rate limiting, sender allowlist, filename sanitization, and startup temp file purge. Custom words: plain text (no commands) adds words, `-word` removes one, whole-message control words `0`/`list`/`help` (EN+HE); stored per sender in memory by `word_session_store.py` (sliding TTL). Custom words are always **added to** automatic PII removal (`CustomWordDetector(words, base=pipeline.detector)`), never a replacement. The per-file summary is a separate message, never the file's caption.
 - **`processor/pipeline.py`** — Orchestrates cleaning. Routes by file extension, enforces timeout, calls secure cleanup.
 - **`processor/pii_detector.py`** — Wraps Presidio with English NLP (spaCy `en_core_web_sm`). Includes custom recognizers for Israeli PII (Teudat Zehut, 05X phones, +972 format).
 - **`processor/pdf_cleaner.py`** / **`processor/docx_cleaner.py`** — Format-specific cleaners. Extract text, run through PIIDetector, rebuild document, strip metadata.

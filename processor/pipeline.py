@@ -35,6 +35,11 @@ class CleaningPipeline:
         self._pdf_cleaner = PDFCleaner(self._detector)
         self._docx_cleaner = DOCXCleaner(self._detector)
 
+    @property
+    def detector(self) -> PIIDetector:
+        """The loaded automatic PII detector (shared; wrap it, don't copy it)."""
+        return self._detector
+
     def process(self, input_path: Path, detector: PIIDetector | None = None) -> Path:
         """Process a document and return the path to the cleaned file.
 

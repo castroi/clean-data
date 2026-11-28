@@ -1,4 +1,5 @@
 import logging
+import re
 import secrets
 import tempfile
 import time
@@ -31,16 +32,48 @@ DONE_MESSAGE_NOT_DELETED = (
     "automatically. The operator has been alerted."
 )
 
-USAGE_MESSAGE = (
-    "Welcome to Clean-Data! Send me a PDF or DOCX file and I will remove "
-    "all personal data (names, IDs, addresses, emails, phone numbers) and "
-    "document metadata.\n\n"
-    "Supported formats: PDF, DOCX\n"
-    "Max file size: {max_size}MB\n\n"
-    "Commands:\n"
-    "/replace word1, word2, ... — remove specific words instead of automatic PII detection\n"
-    "/end — clear custom words and restore automatic PII detection"
+HELP_MESSAGE = (
+    "Clean-Data removes personal info (names, IDs, phones, emails, addresses) "
+    "and metadata from PDF and DOCX files (max {max_size}MB).\n\n"
+    "Now: {status}\n\n"
+    "• Send a file → cleaned file back\n"
+    "• Send names/words → also removed from your next files, e.g. Amit Levi, דני כהן\n"
+    "• -word → take one word off your list\n"
+    "• list / רשימה → show your list · 0 / נקה → clear it\n\n"
+    "Hebrew names are not detected automatically. Add them as words."
 )
+
+# Whole-message control words (case-insensitive, trailing !.? ignored).
+# Anything else sent as text is a list of words to remove.
+CLEAR_WORDS = {"0", "clear", "נקה", "ביטול", "/end"}
+LIST_WORDS = {"list", "רשימה"}
+HELP_WORDS = {"help", "עזרה", "?", "/help", "/start", "start", "hi", "hello", "hey", "שלום", "היי", "הי"}
+# Chat replies that must never become words to remove.
+ACK_WORDS = {"thanks", "thank you", "thx", "ok", "okay", "cool", "תודה", "תודה רבה", "אוקיי", "אוקי", "סבבה", "מעולה"}
+LEGACY_REPLACE = "/replace"
+REMOVE_PREFIXES = ("-", "–", "—")
+# A caption item longer than this many words gets a reply instead of being saved quietly.
+CAPTION_QUIET_MAX_WORDS = 3
+
+_URL_RE = re.compile(r"https?://|www\.", re.IGNORECASE)
+_HAS_ALNUM_RE = re.compile(r"\w")
+_SPLIT_RE = re.compile(r"[,\n]")
+
+
+def _normalize_control(text: str) -> str:
+    """Lowercased, inner spaces collapsed, trailing !. dropped ("Thanks!" → "thanks")."""
+    text = " ".join(text.lower().split())
+    return text if text == "?" else text.rstrip("!.?").strip()
+
+
+def _join(words: list[str]) -> str:
+    return ", ".join(words)
+
+
+def _ttl_text(seconds: int) -> str:
+    if seconds % 3600 == 0:
+        return f"{seconds // 3600}h"
+    return f"{max(1, round(seconds / 60))} min"
 
 
 class SignalBot:
@@ -72,12 +105,13 @@ class SignalBot:
         self._rejected_since_log = 0
         self._last_reject_log = 0.0
 
-        # Per-sender custom word sessions for /replace command
+        # Per-sender custom word lists (words sent as plain text)
         self._word_store = WordSessionStore(
             ttl_seconds=self._config.WORD_SESSION_TTL_SECONDS,
             max_words=self._config.MAX_WORDS_PER_SENDER,
             max_word_length=self._config.MAX_WORD_LENGTH,
             max_sessions=self._config.MAX_WORD_SESSIONS,
+            max_age_seconds=self._config.MAX_WORD_SESSION_AGE_SECONDS,
         )
 
     @staticmethod
@@ -171,18 +205,18 @@ class SignalBot:
             logger.warning("Message rate limit exceeded; message ignored")
             return
 
-        # Command handling — must happen before attachment check
-        if message and message.strip().startswith("/"):
-            self._handle_command(sender, message.strip())
-            # If the message has no attachments, we're done
-            if not attachments:
-                return
+        # Any message from the sender keeps their word list alive.
+        self._word_store.touch(sender)
+
+        text = (message or "").strip()
+        if text:
+            # A caption on a file is handled the same way, but quietly: the
+            # file's summary already shows the words that were applied.
+            self._handle_text(sender, text, with_file=bool(attachments))
+        elif not attachments:
+            self._send_message(sender, self._help_text(sender))
 
         if not attachments:
-            self._send_message(
-                sender,
-                USAGE_MESSAGE.format(max_size=self._config.MAX_FILE_SIZE_MB),
-            )
             return
 
         for attachment in attachments:
@@ -191,30 +225,121 @@ class SignalBot:
                 return
             self._process_attachment(sender, attachment)
 
-    def _handle_command(self, sender: str, message: str) -> None:
-        """Handle a /command message from a sender."""
-        if message.lower().startswith("/replace "):
-            raw_words = message[len("/replace "):]
-            words = [w.strip() for w in raw_words.split(",") if w.strip()]
-            if not words:
-                self._send_message(sender, "Usage: /replace word1, word2, word3")
-                return
-            try:
-                all_words = self._word_store.add_words(sender, words)
-            except ValueError as e:
-                self._send_message(sender, str(e))
-                return
-            self._send_message(
-                sender,
-                f"{len(words)} word(s) added ({len(all_words)} total active).\n"
-                f"These words will be removed from documents sent in the next hour.\n"
-                f"Send /end to clear.",
-            )
-        elif message.lower().strip() == "/end":
-            self._word_store.clear(sender)
-            self._send_message(sender, "Custom words cleared. Back to automatic PII detection.")
+    # --- text: control words, words to add, -words to remove ---------------
+
+    def _help_text(self, sender: str) -> str:
+        words = self._word_store.get_words(sender)
+        if words:
+            status = f"automatic removal + {len(words)} custom word(s) ({_join(words)})."
         else:
-            self._send_message(sender, "Unknown command. Available: /replace, /end")
+            status = "automatic removal only (no custom words)."
+        return HELP_MESSAGE.format(max_size=self._config.MAX_FILE_SIZE_MB, status=status)
+
+    def _list_text(self, sender: str) -> str:
+        words = self._word_store.get_words(sender)
+        if not words:
+            return "No custom words. Automatic PII removal only."
+        return f"Your words (copy and send to reuse later):\n{_join(words)}"
+
+    def _handle_text(self, sender: str, text: str, with_file: bool = False) -> None:
+        """Handle the text of a message (or a file's caption).
+
+        Whole-message control words first; then chat filler and unusable text
+        (which never become words); otherwise a comma/newline separated list:
+        "-word" items leave the list, the rest join it.
+        """
+        control = _normalize_control(text)
+        legacy = False
+
+        if control in CLEAR_WORDS:
+            self._word_store.clear(sender)
+            self._send_message(sender, "Custom words cleared. Automatic PII removal only.")
+            return
+        if control in LIST_WORDS:
+            self._send_message(sender, self._list_text(sender))
+            return
+        if control in HELP_WORDS or control in ACK_WORDS:
+            if not with_file:
+                self._send_message(
+                    sender,
+                    self._help_text(sender) if control in HELP_WORDS else "Not added as a word.",
+                )
+            return
+        if control.startswith(LEGACY_REPLACE):
+            # Old habit: accept the words, say the command is no longer needed.
+            text = text.strip()[len(LEGACY_REPLACE):]
+            legacy = True
+        elif text.startswith("/") or _URL_RE.search(text) or not _HAS_ALNUM_RE.search(text) or len(text) < 2:
+            # Unknown command, a link, emoji/punctuation only, or one character.
+            if not with_file:
+                self._send_message(sender, self._help_text(sender))
+            return
+
+        to_add, to_remove = [], []
+        for item in _SPLIT_RE.split(text):
+            item = item.strip()
+            if item.startswith(REMOVE_PREFIXES):
+                item = item.lstrip("".join(REMOVE_PREFIXES)).strip()
+                if item:
+                    to_remove.append(item)
+            elif item:
+                to_add.append(item)
+
+        if not to_add and not to_remove:
+            if not with_file:
+                self._send_message(sender, self._help_text(sender))
+            return
+
+        lines: list[str] = []
+        if to_remove:
+            removed, missing = self._word_store.remove_words(sender, to_remove)
+            if removed:
+                lines.append(f"Removed: {_join(removed)}.")
+            if missing:
+                lines.append(f"Not on your list: {_join(missing)}.")
+
+        if to_add:
+            try:
+                added, existing = self._word_store.add_words(sender, to_add)
+            except ValueError as e:
+                self._send_message(
+                    sender,
+                    f"{e} Nothing was added. Take some off with -word, or send 0 to clear the list.",
+                )
+                return
+            if added:
+                lines.append(f"Will remove: {_join(added)} (+ automatic PII).")
+            if existing:
+                lines.append(f"Already on your list: {_join(existing)}.")
+
+        # A caption of short names stays quiet (the summary after the file shows
+        # them). One that reads like a sentence ("contract for Dana Cohen") was
+        # still saved as a phrase, so say so: it likely won't match anything.
+        sentence_like = any(len(item.split()) > CAPTION_QUIET_MAX_WORDS for item in to_add)
+        if with_file and not to_remove and not legacy and not sentence_like:
+            return
+        if with_file and sentence_like:
+            lines.append("Saved from the file's caption. Separate names with commas if this isn't one name.")
+
+        words = self._word_store.get_words(sender)
+        if words:
+            if to_remove:
+                lines.append(f"Your list: {_join(words)}")
+            lines.append(f"Kept for {_ttl_text(self._word_store.ttl_seconds)} after your last message.")
+            lines.append("Wrong one? Send -word. Clear all: 0")
+        else:
+            lines.append("Your list is empty. Automatic PII removal only.")
+        if legacy:
+            lines.append("No command needed next time: just send the words.")
+        self._send_message(sender, "\n".join(lines))
+
+    @staticmethod
+    def _summary_text(detector: CustomWordDetector) -> str:
+        """What one file was cleaned with. No counts: in PDFs a count of
+        matches in the extracted text need not equal what was blanked."""
+        if not detector.words:
+            return "Cleaned with: automatic PII removal only (no custom words)."
+        return f"Cleaned with: automatic PII removal + your words ({_join(detector.words)})."
 
     def _process_attachment(self, sender: str, attachment: dict) -> None:
         """Process a single file attachment."""
@@ -273,10 +398,9 @@ class SignalBot:
                 return
             input_path.write_bytes(content)
 
-            # Choose detector: custom words override default PII detection
-            detector = None
-            if self._word_store.has_active_session(sender):
-                detector = CustomWordDetector(self._word_store.get_words(sender))
+            # Automatic PII is always removed; the sender's words are added on
+            # top. A fresh detector per file counts what this file contained.
+            detector = CustomWordDetector(self._word_store.get_words(sender), base=self._pipeline.detector)
 
             # Process
             cleaned_path = self._pipeline.process(input_path, detector=detector)
@@ -299,6 +423,11 @@ class SignalBot:
             )
             if not sent:
                 self._send_message(sender, "Could not send the cleaned file back. Please try again.")
+            else:
+                # A separate message, never the file's caption: the caption
+                # travels with the file when it is forwarded, and this text
+                # names the custom words.
+                self._send_message(sender, self._summary_text(detector))
 
         except ProcessingTimeout:
             logger.error("Processing timed out for attachment")
