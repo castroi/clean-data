@@ -52,6 +52,8 @@ HELP_WORDS = {"help", "עזרה", "?", "/help", "/start", "start", "hi", "hello"
 ACK_WORDS = {"thanks", "thank you", "thx", "ok", "okay", "cool", "תודה", "תודה רבה", "אוקיי", "אוקי", "סבבה", "מעולה"}
 LEGACY_REPLACE = "/replace"
 REMOVE_PREFIXES = ("-", "–", "—")
+# A caption item longer than this many words gets a reply instead of being saved quietly.
+CAPTION_QUIET_MAX_WORDS = 3
 
 # Labels for automatic PII types in the summary (counts only, never values).
 AUTO_LABELS = {
@@ -122,6 +124,7 @@ class SignalBot:
             max_words=self._config.MAX_WORDS_PER_SENDER,
             max_word_length=self._config.MAX_WORD_LENGTH,
             max_sessions=self._config.MAX_WORD_SESSIONS,
+            max_age_seconds=self._config.MAX_WORD_SESSION_AGE_SECONDS,
         )
 
     @staticmethod
@@ -322,8 +325,14 @@ class SignalBot:
             if existing:
                 lines.append(f"Already on your list: {_join(existing)}.")
 
-        if with_file and not to_remove and not legacy:
-            return  # quiet caption: the summary after the file shows the words
+        # A caption of short names stays quiet (the summary after the file shows
+        # them). One that reads like a sentence ("contract for Dana Cohen") was
+        # still saved as a phrase, so say so: it likely won't match anything.
+        sentence_like = any(len(item.split()) > CAPTION_QUIET_MAX_WORDS for item in to_add)
+        if with_file and not to_remove and not legacy and not sentence_like:
+            return
+        if with_file and sentence_like:
+            lines.append("Saved from the file's caption. Separate names with commas if this isn't one name.")
 
         words = self._word_store.get_words(sender)
         if words:

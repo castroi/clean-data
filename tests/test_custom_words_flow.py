@@ -7,6 +7,7 @@ file is followed by a separate summary message.
 
 Uses a fake pipeline (no PyMuPDF/Presidio), so it runs without NLP models.
 """
+import re
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -29,7 +30,10 @@ class FakeBase:
     """Automatic detector stand-in: finds every 'a@b.com' as an email."""
 
     def detect_entities(self, text):
-        return [{"type": "EMAIL_ADDRESS", "text": "a@b.com", "start": 0, "end": 7, "score": 1.0}] * text.count("a@b.com")
+        return [
+            {"type": "EMAIL_ADDRESS", "text": m.group(), "start": m.start(), "end": m.end(), "score": 1.0}
+            for m in re.finditer(re.escape("a@b.com"), text)
+        ]
 
     def detect_and_remove(self, text):
         return " ".join(text.replace("a@b.com", "").split())
@@ -290,6 +294,22 @@ def test_one_caption_applies_to_every_file_in_the_message(tmp_path):
     assert sum(r.startswith("Removed: Ruti ×1") for r in replies) == 2
 
 
+def test_sentence_like_caption_gets_a_reply(tmp_path):
+    """"contract for Dana Cohen" is saved as one phrase: tell the user."""
+    bot = _bot(tmp_path, doc_text="Dana Cohen")
+    replies = _send(bot, "contract for Dana Cohen", [_att()])
+    assert _words(bot) == ["contract for Dana Cohen"]
+    [note] = [r for r in replies if r.startswith("Will remove:")]
+    assert "Separate names with commas" in note
+    assert replies[-1].startswith("Removed: contract for Dana Cohen ×0")
+
+
+def test_short_names_caption_stays_quiet(tmp_path):
+    bot = _bot(tmp_path)
+    replies = _send(bot, "Dana Cohen, Ruti", [_att()])
+    assert not any(r.startswith("Will remove:") for r in replies)
+
+
 def test_caption_filler_ignored_silently(tmp_path):
     bot = _bot(tmp_path)
     replies = _send(bot, "thanks", [_att()])
@@ -350,6 +370,20 @@ def test_flood_guard_still_applies_to_text(tmp_path):
     for i in range(signal_bot.RATE_LIMIT_MAX_MESSAGES + 5):
         bot.handle_message(sender=SENDER, message=f"w{i}", attachments=None)
     assert len(_words(bot)) == signal_bot.RATE_LIMIT_MAX_MESSAGES
+
+
+def test_hard_cap_clears_an_active_list(tmp_path):
+    """Activity can't keep a list (PII) in memory past the hard cap."""
+    bot = _bot(tmp_path, WORD_SESSION_TTL_SECONDS=100, MAX_WORD_SESSION_AGE_SECONDS=250)
+    _send(bot, "Amit")
+    with patch("word_session_store.time") as t:
+        import time as real_time
+        start = real_time.time()
+        for offset in (90, 180):
+            t.time.return_value = start + offset
+            _send(bot, "list")             # keeps it alive...
+        t.time.return_value = start + 251  # ...but not past 250 s after it started
+        assert _words(bot) == []
 
 
 # --- DOCX end to end (python-docx only, no NLP) ------------------------------------

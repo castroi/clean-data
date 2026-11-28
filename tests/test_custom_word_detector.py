@@ -73,6 +73,26 @@ def test_longer_phrase_wins_over_its_part():
     assert detector.detect_and_remove("Signed: Dana Cohen") == "Signed:"
 
 
+def test_phrase_matches_across_line_break_and_extra_spaces():
+    """PDF text often breaks a name over two lines."""
+    detector = CustomWordDetector(["Dana Cohen"])
+    for text in ["Dana\nCohen signed", "Dana  Cohen signed", "Dana\u00a0Cohen signed"]:
+        assert detector.detect_and_remove(text) == "signed", repr(text)
+
+
+def test_word_with_extra_spaces_is_normalized():
+    detector = CustomWordDetector(["  Dana   Cohen "])
+    assert detector.custom_hits == {"Dana Cohen": 0}
+    assert detector.detect_and_remove("Dana Cohen signed") == "signed"
+
+
+def test_nfc_and_nfd_forms_match():
+    import unicodedata
+    nfd = unicodedata.normalize("NFD", "José")
+    assert CustomWordDetector(["José"]).detect_and_remove(f"{nfd} signed") == "signed"
+    assert CustomWordDetector([nfd]).detect_and_remove("José signed") == "signed"
+
+
 def test_symbols_in_word_are_literal():
     detector = CustomWordDetector(["054-123.4567", "a+b"])
     assert detector.detect_and_remove("call 054-123.4567 or 054x123x4567, a+b") == "call or 054x123x4567,"
@@ -97,6 +117,18 @@ def test_hebrew_prefix_letters_match_and_are_kept():
     assert result == "אמר ל וש הלך"
     detector.detect_entities("דני אמר לדני ושדני הלך")
     assert detector.custom_hits == {"דני": 3}
+
+
+def test_three_hebrew_prefix_letters():
+    detector = CustomWordDetector(["דני"])
+    assert detector.detect_and_remove("ושלדני בא") == "ושל בא"
+    detector.detect_entities("ושלדני בא")
+    assert detector.custom_hits == {"דני": 1}
+
+
+def test_four_letters_before_word_not_treated_as_prefixes():
+    detector = CustomWordDetector(["דני"])
+    assert detector.detect_and_remove("ושלבדני") == "ושלבדני"
 
 
 def test_hebrew_word_inside_longer_word_not_matched():
@@ -132,6 +164,29 @@ def test_automatic_pii_still_removed_with_custom_words():
     assert "Amit" not in result
     assert "a@b.com" not in result
     assert "today" in result
+
+
+class NameBase:
+    """Automatic detector that only recognises the full name "Amit Levi"."""
+
+    def detect_entities(self, text):
+        i = text.find("Amit Levi")
+        return [] if i == -1 else [{"type": "PERSON", "text": "Amit Levi", "start": i, "end": i + 9, "score": 0.9}]
+
+    def detect_and_remove(self, text):
+        raise AssertionError("not used when there are custom words")
+
+
+def test_custom_words_do_not_hide_names_from_automatic_detection():
+    """Both are found on the original text: removing "Amit" first would have
+    left "Levi" unrecognised."""
+    detector = CustomWordDetector(["Amit"], base=NameBase())
+    assert detector.detect_and_remove("Signed by Amit Levi today") == "Signed by today"
+
+
+def test_overlapping_matches_removed_once():
+    detector = CustomWordDetector(["Dana", "Dana Cohen", "Cohen"])
+    assert detector.detect_and_remove("Dana Cohen, Cohen.") == ",."
 
 
 def test_base_alone_when_no_custom_words():

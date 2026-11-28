@@ -172,6 +172,7 @@ All configuration is done via environment variables or a `.env` file.
 | `MAX_WORDS_PER_SENDER` | Maximum custom words per sender | `30` |
 | `MAX_WORD_LENGTH` | Maximum length per custom word | `100` |
 | `MAX_WORD_SESSIONS` | Maximum senders with a word list at the same time | `100` |
+| `MAX_WORD_SESSION_AGE_SECONDS` | Hard cap: a word list is cleared this long after it was started, even while in use | `86400` (24 hours) |
 
 For strongest PII protection, mount `TEMP_DIR` on a `tmpfs` volume so temporary files never touch disk.
 
@@ -210,15 +211,15 @@ bot → Your words (copy and send to reuse later):
 | Send | Does |
 |---|---|
 | `Amit Levi, Ruti` (any text) | Adds words to your list |
-| a file with a caption | Adds the caption's words, then cleans the file (no extra confirmation) |
+| a file with a caption | Adds the caption's words, then cleans the file (a reply only if the caption reads like a sentence) |
 | `-Ruti` | Takes one word off the list |
 | `list` / `רשימה` | Shows the list as one line you can copy and send again later |
 | `0` / `clear` / `נקה` | Clears the list |
 | `help` / `עזרה` / `?` | Help, with what is active right now |
 
-- Matching is whole-word and case-insensitive: `Dan` does not touch "Jordan", `43` does not touch "1435". Hebrew words also match after prefix letters (ו ה ב ל מ ש כ): `דני` removes it from "לדני", keeping the "ל".
+- Matching is whole-word and case-insensitive, and a phrase matches across a line break or double space: `Dan` does not touch "Jordan", `43` does not touch "1435". Hebrew words also match after up to three prefix letters (ו ה ב ל מ ש כ): `דני` removes it from "לדני", keeping the "ל".
 - Chat replies like `thanks` / `תודה` / `ok`, emoji, single characters and links are never stored as words.
-- The list lives in memory only. It is cleared after 2 hours with no message or file (every message or file restarts the clock), by `0`, or by a restart. To reuse a list later, send `list` and keep the reply: paste it back any time.
+- The list lives in memory only. It is cleared after 2 hours with no message or file (every message or file restarts the clock), 24 hours after it was started at the latest, by `0`, or by a restart. To reuse a list later, send `list` and keep the reply: paste it back any time.
 - After each file the bot sends a separate summary: custom words by name with a count (a ×0 shows a spelling that didn't match), automatic PII as counts per type only. The summary is never the cleaned file's caption, so forwarding the file does not forward the names.
 - Automatic name detection is English only, so add Hebrew names as words.
 - Known limitation: in PDFs, a matched word is blanked with PyMuPDF's text search, which can also blank the same letters inside a longer word on that page. DOCX output is exact.

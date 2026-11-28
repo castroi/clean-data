@@ -11,11 +11,13 @@
 - **Whole-message control words**, English + Hebrew, exact match (idea from train-notifier `route.ts`): `0 / clear / נקה / ביטול`, `list / רשימה`, `help / עזרה / ? / /help / /start` and greetings.
 - **Never stored as words:** chat filler (`thanks / תודה / ok ...`), emoji/punctuation only, one character, links, unknown `/commands`.
 - **No 1/2 confirmation.** Words are added immediately and echoed back; a wrong one is undone with `-word`. The per-file count (`×0`) catches typos.
-- **Caption on a file** adds its words quietly, then the file is cleaned; one caption covers every file in that message.
+- **Caption on a file** adds its words quietly, then the file is cleaned; one caption covers every file in that message. A caption item of more than 3 words (reads like a sentence) gets a reply, since it is saved as one phrase.
 - **Session stays** (many files in a row with the same names): in memory only, sliding TTL — every message or file restarts it. Default 2 h (was 1 h, refreshed only on `/replace`). Word cap 30 (was 15).
 - **Don't retype, don't retain:** `list` answers with one copyable line; pasting it back restores the list. The user's own Signal history is the storage; the bot keeps nothing on disk.
 - **Every file gets a summary message:** custom words with counts, automatic PII as counts per type only (never values). Sent as a **separate** message — the file's caption travels when forwarded, so it stays PII-free (`DONE_MESSAGE`).
-- **Matching:** whole-word, case-insensitive; Hebrew words also match after up to two prefix letters (ו ה ב ל מ ש כ), the prefix is kept. Longest phrase first.
+- **Matching:** whole-word, case-insensitive, NFC-normalized; the parts of a phrase match across any whitespace (line breaks in PDF text); Hebrew words also match after up to three prefix letters (ו ה ב ל מ ש כ), the prefix is kept. Hebrew niqqud is not handled (not expected in the documents).
+- **One removal pass:** custom-word and automatic matches are found on the same original text, merged, and deleted together, so removing a custom word can't hide a name from the automatic detector.
+- **Hard cap:** a list is cleared 24 h after it started even if in use (`MAX_WORD_SESSION_AGE_SECONDS`), so activity can't keep PII in memory forever.
 - **Legacy:** `/replace a, b` still adds the words with a "no command needed" hint; `/end` clears.
 
 ## Changes
@@ -33,5 +35,8 @@
 - `tests/test_custom_word_detector.py`, `tests/test_word_session_store.py` — rewritten for the new behaviour.
 
 ## Known limitation / follow-up
+
+Also from the security review: the PDF summary counts matches in the extracted text, not redactions actually applied, so it can report a word as removed when `search_for` found nothing on the page (separate PR, together with the substring issue below).
+
 
 PDF redaction blanks each match via `page.search_for(text)`, which is a plain substring search on the page, so a custom word can still be blanked inside a longer word in PDFs (detection itself is whole-word). Follow-up: redact from `page.get_text("words")` positions instead.

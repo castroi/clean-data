@@ -86,6 +86,7 @@ services:
       MAX_WORDS_PER_SENDER: ${MAX_WORDS_PER_SENDER:-30}
       MAX_WORD_LENGTH: ${MAX_WORD_LENGTH:-100}
       MAX_WORD_SESSIONS: ${MAX_WORD_SESSIONS:-100}
+      MAX_WORD_SESSION_AGE_SECONDS: ${MAX_WORD_SESSION_AGE_SECONDS:-86400}
       # Fixed by this deployment:
       SIGNAL_API_URL: http://wrapper-clean-data:8080
       SIGNAL_TOKEN_FILE: /run/secrets/signal_token

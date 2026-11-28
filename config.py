@@ -73,6 +73,7 @@ class Config:
     MAX_WORDS_PER_SENDER: int = int(os.getenv("MAX_WORDS_PER_SENDER", "30"))
     MAX_WORD_LENGTH: int = int(os.getenv("MAX_WORD_LENGTH", "100"))
     MAX_WORD_SESSIONS: int = int(os.getenv("MAX_WORD_SESSIONS", "100"))
+    MAX_WORD_SESSION_AGE_SECONDS: int = int(os.getenv("MAX_WORD_SESSION_AGE_SECONDS", "86400"))
 
 
 def load_signal_token(config: Config) -> str:

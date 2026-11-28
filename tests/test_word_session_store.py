@@ -162,3 +162,44 @@ def test_long_word_truncated():
     store = WordSessionStore(max_word_length=5)
     store.add_words(SENDER_A, ["abcdefgh"])
     assert store.get_words(SENDER_A) == ["abcde"]
+
+
+def test_words_normalized_for_dedupe_and_removal():
+    import unicodedata
+    store = WordSessionStore()
+    store.add_words(SENDER_A, ["Dana  Cohen", unicodedata.normalize("NFD", "José")])
+    assert store.add_words(SENDER_A, ["dana cohen", "JOSÉ"]) == ([], ["dana cohen", "JOSÉ"])
+    assert store.remove_words(SENDER_A, ["Dana Cohen"]) == (["Dana Cohen"], [])
+    assert store.get_words(SENDER_A) == ["José"]
+
+
+def test_hard_cap_even_when_active():
+    store = WordSessionStore(ttl_seconds=100, max_age_seconds=250)
+    store.add_words(SENDER_A, ["Amit"])
+    for offset in (90, 180, 240):
+        p = _later(offset)
+        try:
+            store.touch(SENDER_A)
+            assert store.has_active_session(SENDER_A)
+        finally:
+            p.stop()
+    p = _later(251)
+    try:
+        assert not store.has_active_session(SENDER_A)
+    finally:
+        p.stop()
+
+
+def test_adding_words_does_not_extend_past_hard_cap():
+    store = WordSessionStore(ttl_seconds=100, max_age_seconds=150)
+    store.add_words(SENDER_A, ["Amit"])
+    p = _later(90)  # still within the 100 s idle timeout
+    try:
+        store.add_words(SENDER_A, ["Ruti"])
+    finally:
+        p.stop()
+    p = _later(151)
+    try:
+        assert store.get_words(SENDER_A) == []
+    finally:
+        p.stop()
