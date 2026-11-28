@@ -55,19 +55,6 @@ REMOVE_PREFIXES = ("-", "–", "—")
 # A caption item longer than this many words gets a reply instead of being saved quietly.
 CAPTION_QUIET_MAX_WORDS = 3
 
-# Labels for automatic PII types in the summary (counts only, never values).
-AUTO_LABELS = {
-    "PERSON": "name",
-    "EMAIL_ADDRESS": "email",
-    "PHONE_NUMBER": "phone",
-    "LOCATION": "location",
-    "IL_ID_NUMBER": "ID",
-    "CREDIT_CARD": "card",
-    "IBAN_CODE": "IBAN",
-    "IP_ADDRESS": "IP",
-    "URL": "link",
-}
-
 _URL_RE = re.compile(r"https?://|www\.", re.IGNORECASE)
 _HAS_ALNUM_RE = re.compile(r"\w")
 _SPLIT_RE = re.compile(r"[,\n]")
@@ -348,25 +335,11 @@ class SignalBot:
 
     @staticmethod
     def _summary_text(detector: CustomWordDetector) -> str:
-        """What was removed from one file: custom words by name, automatic PII
-        as counts per type only (never the values found)."""
-        auto_total = sum(detector.auto_hits.values())
-        if auto_total:
-            by_type = ", ".join(
-                f"{n} {AUTO_LABELS.get(t, t.lower())}" for t, n in detector.auto_hits.most_common()
-            )
-            auto = f"{auto_total} automatic ({by_type})"
-        else:
-            auto = "no automatic PII found"
-
-        if not detector.custom_hits:
-            return f"Removed: {auto}.\nNo custom words active."
-        custom = ", ".join(f"{w} ×{n}" for w, n in detector.custom_hits.items())
-        lines = [f"Removed: {custom} + {auto}."]
-        missing = [w for w, n in detector.custom_hits.items() if n == 0]
-        if missing:
-            lines.append(f"Not found: {_join(missing)}. Try another spelling?")
-        return "\n".join(lines)
+        """What one file was cleaned with. No counts: in PDFs a count of
+        matches in the extracted text need not equal what was blanked."""
+        if not detector.words:
+            return "Cleaned with: automatic PII removal only (no custom words)."
+        return f"Cleaned with: automatic PII removal + your words ({_join(detector.words)})."
 
     def _process_attachment(self, sender: str, attachment: dict) -> None:
         """Process a single file attachment."""

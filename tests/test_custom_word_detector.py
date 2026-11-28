@@ -59,8 +59,7 @@ def test_whole_words_only():
     detector = CustomWordDetector(["Dan", "43"])
     text = "Dan met Jordan. Danger at 1435, room 43."
     assert detector.detect_and_remove(text) == "met Jordan. Danger at 1435, room."
-    detector.detect_entities(text)  # counting happens here (cleaners call it first)
-    assert detector.custom_hits == {"Dan": 1, "43": 1}
+    assert [e["text"] for e in detector.detect_entities(text)] == ["Dan", "43"]
 
 
 def test_word_next_to_punctuation_matches():
@@ -82,7 +81,7 @@ def test_phrase_matches_across_line_break_and_extra_spaces():
 
 def test_word_with_extra_spaces_is_normalized():
     detector = CustomWordDetector(["  Dana   Cohen "])
-    assert detector.custom_hits == {"Dana Cohen": 0}
+    assert detector.words == ["Dana Cohen"]
     assert detector.detect_and_remove("Dana Cohen signed") == "signed"
 
 
@@ -115,15 +114,13 @@ def test_hebrew_prefix_letters_match_and_are_kept():
     result = detector.detect_and_remove("דני אמר לדני ושדני הלך")
     assert "דני" not in result
     assert result == "אמר ל וש הלך"
-    detector.detect_entities("דני אמר לדני ושדני הלך")
-    assert detector.custom_hits == {"דני": 3}
+    assert len(detector.detect_entities("דני אמר לדני ושדני הלך")) == 3
 
 
 def test_three_hebrew_prefix_letters():
     detector = CustomWordDetector(["דני"])
     assert detector.detect_and_remove("ושלדני בא") == "ושל בא"
-    detector.detect_entities("ושלדני בא")
-    assert detector.custom_hits == {"דני": 1}
+    assert [e["text"] for e in detector.detect_entities("ושלדני בא")] == ["דני"]
 
 
 def test_four_letters_before_word_not_treated_as_prefixes():
@@ -195,12 +192,14 @@ def test_base_alone_when_no_custom_words():
     assert [e["type"] for e in detector.detect_entities("write a@b.com")] == ["EMAIL_ADDRESS"]
 
 
-def test_counts_custom_and_automatic_hits():
+def test_entities_include_automatic_and_custom():
     detector = CustomWordDetector(["Amit", "Ruti"], base=FakeBase())
-    detector.detect_entities("Amit, a@b.com")
-    detector.detect_entities("amit again")
-    assert detector.custom_hits == {"Amit": 2, "Ruti": 0}
-    assert detector.auto_hits == {"EMAIL_ADDRESS": 1}
+    entities = detector.detect_entities("Amit, a@b.com")
+    assert sorted(e["type"] for e in entities) == ["CUSTOM_WORD", "EMAIL_ADDRESS"]
+
+
+def test_words_deduplicated_case_insensitively():
+    assert CustomWordDetector(["Amit", "amit", " AMIT "]).words == ["Amit"]
 
 
 # --- edge cases -----------------------------------------------------------------

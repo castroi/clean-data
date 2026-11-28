@@ -1,6 +1,5 @@
 import re
 import unicodedata
-from collections import Counter
 from typing import Any
 
 from processor.pii_detector import PIIDetector
@@ -48,10 +47,7 @@ class CustomWordDetector(PIIDetector):
     one pass, so removing a custom word never hides PII from the automatic
     detector (e.g. "Levi" in "Amit Levi" once "Amit" is gone).
 
-    One instance is used per document: it counts what it finds, per custom
-    word (``custom_hits``) and per automatic PII type (``auto_hits``), so the
-    bot can tell the user what was removed without echoing any auto-detected
-    value. Text is NFC-normalized before matching.
+    Text is NFC-normalized before matching.
     """
 
     def __init__(self, words: list[str], base: PIIDetector | None = None) -> None:
@@ -62,36 +58,34 @@ class CustomWordDetector(PIIDetector):
             w = normalize_word(w)
             if w and w.lower() not in (x.lower() for x in self._words):
                 self._words.append(w)
-        self._patterns = [(w, _word_pattern(w)) for w in self._words]
-        self.custom_hits: dict[str, int] = {w: 0 for w in self._words}
-        self.auto_hits: Counter[str] = Counter()
+        self._patterns = [_word_pattern(w) for w in self._words]
 
-    def _find(self, text: str) -> tuple[list[dict[str, Any]], list[tuple[str, dict[str, Any]]]]:
-        """(automatic entities, [(custom word, entity)]) on ``text``; no counting."""
+    @property
+    def words(self) -> list[str]:
+        """The custom words in use (normalized, deduplicated)."""
+        return list(self._words)
+
+    def _find(self, text: str) -> list[dict[str, Any]]:
+        """Automatic entities (if any base) plus every custom-word match."""
         auto = self._base.detect_entities(text) if self._base is not None else []
         custom = [
-            (word, {
+            {
                 "type": "CUSTOM_WORD",
                 "text": m.group("word"),
                 "start": m.start("word"),
                 "end": m.end("word"),
                 "score": 1.0,
-            })
-            for word, pattern in self._patterns
+            }
+            for pattern in self._patterns
             for m in pattern.finditer(text)
         ]
-        return auto, custom
+        return auto + custom
 
     def detect_entities(self, text: str) -> list[dict[str, Any]]:
         """Automatic PII entities (if any base) plus every custom-word match."""
         if not text.strip():
             return []
-        text = unicodedata.normalize("NFC", text)
-        auto, custom = self._find(text)
-        self.auto_hits.update(e["type"] for e in auto)
-        for word, _ in custom:
-            self.custom_hits[word] += 1
-        return auto + [e for _, e in custom]
+        return self._find(unicodedata.normalize("NFC", text))
 
     def detect_and_remove(self, text: str) -> str:
         """Remove custom words and automatic PII, found on the same text."""
@@ -102,8 +96,7 @@ class CustomWordDetector(PIIDetector):
             return self._base.detect_and_remove(text) if self._base is not None else text
 
         text = unicodedata.normalize("NFC", text)
-        auto, custom = self._find(text)
-        spans = sorted((e["start"], e["end"]) for e in auto + [e for _, e in custom])
+        spans = sorted((e["start"], e["end"]) for e in self._find(text))
 
         # Merge overlapping spans, then delete them in one pass.
         merged: list[list[int]] = []

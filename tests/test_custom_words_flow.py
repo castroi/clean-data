@@ -258,7 +258,7 @@ def test_file_without_words_uses_automatic_detection(tmp_path):
     [detector] = bot._pipeline.used
     assert detector._base is bot._pipeline.detector  # automatic detection on
     assert replies[-2] == DONE_MESSAGE
-    assert replies[-1] == "Removed: 2 automatic (2 email).\nNo custom words active."
+    assert replies[-1] == "Cleaned with: automatic PII removal only (no custom words)."
 
 
 def test_file_with_words_keeps_automatic_detection(tmp_path):
@@ -267,10 +267,7 @@ def test_file_with_words_keeps_automatic_detection(tmp_path):
     replies = _send(bot, "", [_att()])
     [detector] = bot._pipeline.used
     assert detector._base is bot._pipeline.detector
-    assert replies[-1] == (
-        "Removed: Amit ×2, Ruti ×0 + 1 automatic (1 email).\n"
-        "Not found: Ruti. Try another spelling?"
-    )
+    assert replies[-1] == "Cleaned with: automatic PII removal + your words (Amit, Ruti)."
 
 
 def test_caption_adds_words_quietly_before_cleaning(tmp_path):
@@ -278,20 +275,20 @@ def test_caption_adds_words_quietly_before_cleaning(tmp_path):
     replies = _send(bot, "Ruti", [_att()])
     assert _words(bot) == ["Ruti"]
     assert not any("Will remove" in r for r in replies)  # no extra confirmation
-    assert replies[-1].startswith("Removed: Ruti ×1")
+    assert replies[-1] == "Cleaned with: automatic PII removal + your words (Ruti)."
 
 
 def test_caption_words_stay_for_the_next_file(tmp_path):
     bot = _bot(tmp_path, doc_text="Ruti")
     _send(bot, "Ruti", [_att("a1")])
     replies = _send(bot, "", [_att("a2")])
-    assert replies[-1].startswith("Removed: Ruti ×1")
+    assert replies[-1] == "Cleaned with: automatic PII removal + your words (Ruti)."
 
 
 def test_one_caption_applies_to_every_file_in_the_message(tmp_path):
     bot = _bot(tmp_path, doc_text="Ruti")
     replies = _send(bot, "Ruti", [_att("a1"), _att("a2")])
-    assert sum(r.startswith("Removed: Ruti ×1") for r in replies) == 2
+    assert replies.count("Cleaned with: automatic PII removal + your words (Ruti).") == 2
 
 
 def test_sentence_like_caption_gets_a_reply(tmp_path):
@@ -301,7 +298,7 @@ def test_sentence_like_caption_gets_a_reply(tmp_path):
     assert _words(bot) == ["contract for Dana Cohen"]
     [note] = [r for r in replies if r.startswith("Will remove:")]
     assert "Separate names with commas" in note
-    assert replies[-1].startswith("Removed: contract for Dana Cohen ×0")
+    assert replies[-1] == "Cleaned with: automatic PII removal + your words (contract for Dana Cohen)."
 
 
 def test_short_names_caption_stays_quiet(tmp_path):
@@ -332,7 +329,7 @@ def test_no_summary_when_file_send_fails(tmp_path):
     bot = _bot(tmp_path, doc_text="Amit")
     bot._api.send_message.side_effect = lambda **kw: (_ for _ in ()).throw(RuntimeError()) if kw.get("attachments") else None
     replies = _send(bot, "", [_att()])
-    assert not any(r.startswith("Removed:") for r in replies)
+    assert not any(r.startswith("Cleaned with:") for r in replies)
 
 
 # --- session lifetime -------------------------------------------------------------
@@ -404,5 +401,3 @@ def test_docx_custom_words_and_automatic_pii_removed(tmp_path):
     assert "דני" not in text
     assert "a@b.com" not in text
     assert "Jordan Danger stays." in text
-    assert detector.custom_hits == {"Dana Cohen": 1, "דני": 1, "Dan": 0}
-    assert detector.auto_hits == {"EMAIL_ADDRESS": 1}

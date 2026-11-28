@@ -193,8 +193,7 @@ bot → Will remove: Amit Levi, דני כהן (+ automatic PII).
       Wrong one? Send -word. Clear all: 0
 me  → [contract.pdf]
 bot → [cleaned.pdf]
-bot → Removed: Amit Levi ×4, דני כהן ×0 + 6 automatic (2 phone, 1 ID, 3 email).
-      Not found: דני כהן. Try another spelling?
+bot → Cleaned with: automatic PII removal + your words (Amit Levi, דני כהן).
 me  → -דני כהן
 bot → Removed: דני כהן.
       Your list: Amit Levi
@@ -202,7 +201,7 @@ bot → Removed: דני כהן.
       Wrong one? Send -word. Clear all: 0
 me  → [lease.docx]  (caption: Ruti)
 bot → [cleaned.docx]
-bot → Removed: Amit Levi ×2, Ruti ×3 + 2 automatic (1 phone, 1 email).
+bot → Cleaned with: automatic PII removal + your words (Amit Levi, Ruti).
 me  → רשימה
 bot → Your words (copy and send to reuse later):
       Amit Levi, Ruti
@@ -220,7 +219,7 @@ bot → Your words (copy and send to reuse later):
 - Matching is whole-word and case-insensitive, and a phrase matches across a line break or double space: `Dan` does not touch "Jordan", `43` does not touch "1435". Hebrew words also match after up to three prefix letters (ו ה ב ל מ ש כ): `דני` removes it from "לדני", keeping the "ל".
 - Chat replies like `thanks` / `תודה` / `ok`, emoji, single characters and links are never stored as words.
 - The list lives in memory only. It is cleared after 2 hours with no message or file (every message or file restarts the clock), 24 hours after it was started at the latest, by `0`, or by a restart. To reuse a list later, send `list` and keep the reply: paste it back any time.
-- After each file the bot sends a separate summary: custom words by name with a count (a ×0 shows a spelling that didn't match), automatic PII as counts per type only. The summary is never the cleaned file's caption, so forwarding the file does not forward the names.
+- After each file the bot sends a separate line saying what it was cleaned with (automatic PII removal, plus your words if any). It has no counts: in PDFs a count of matches in the text need not equal what was blanked. This line is never the cleaned file's caption, so forwarding the file does not forward the names.
 - Automatic name detection is English only, so add Hebrew names as words.
 - Known limitation: in PDFs, a matched word is blanked with PyMuPDF's text search, which can also blank the same letters inside a longer word on that page. DOCX output is exact.
 - The old `/replace a, b` still works (with a hint that no command is needed); `/end` clears.

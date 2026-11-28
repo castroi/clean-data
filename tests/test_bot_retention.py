@@ -130,7 +130,7 @@ def test_processed_original_deleted_before_processing(tmp_path):
     assert events == ["delete", "process"]  # original gone before the long step
     assert _deleted(bot) == ["att1"]        # and not deleted twice
     # The file goes back with the PII-free caption; the summary follows separately.
-    assert _texts(bot)[-2:] == [DONE_MESSAGE, "Removed: no automatic PII found.\nNo custom words active."]
+    assert _texts(bot)[-2:] == [DONE_MESSAGE, "Cleaned with: automatic PII removal only (no custom words)."]
     assert list((tmp_path / "temp").iterdir()) == []
 
 

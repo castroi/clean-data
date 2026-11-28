@@ -65,7 +65,7 @@ def test_words_removed_and_automatic_pii_still_removed(tmp_path: Path):
     assert "john@example.com" not in cleaned  # automatic PII, still on
     assert "today" in cleaned              # ordinary text survives (spaCy may tag "Project Zorbo" as a name)
     assert DONE_MESSAGE in replies
-    assert any(r.startswith("Removed: Zorbo ×1 + ") and "email" in r for r in replies)
+    assert "Cleaned with: automatic PII removal + your words (Zorbo)." in replies
 
 
 def test_caption_words_applied_to_that_file(tmp_path: Path):
@@ -90,7 +90,7 @@ def test_without_words_automatic_detection_runs(tmp_path: Path):
     assert isinstance(detector, CustomWordDetector)
     assert detector._base is bot._pipeline.detector
     assert "john@example.com" not in cleaned
-    assert any("No custom words active." in r for r in replies)
+    assert "Cleaned with: automatic PII removal only (no custom words)." in replies
 
 
 def test_words_isolated_per_sender(tmp_path: Path):
