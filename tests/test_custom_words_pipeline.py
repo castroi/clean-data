@@ -63,7 +63,7 @@ def test_words_removed_and_automatic_pii_still_removed(tmp_path: Path):
 
     assert "Zorbo" not in cleaned          # custom word
     assert "john@example.com" not in cleaned  # automatic PII, still on
-    assert "Project" in cleaned
+    assert "today" in cleaned              # ordinary text survives (spaCy may tag "Project Zorbo" as a name)
     assert DONE_MESSAGE in replies
     assert any(r.startswith("Removed: Zorbo ×1 + ") and "email" in r for r in replies)
 
