@@ -6,7 +6,7 @@ A privacy-first document sanitization tool. Users send PDF or DOCX files via a S
 
 - Receives PDF and DOCX files via Signal messenger
 - **Automatic PII removal**: Detects and removes names, emails, phone numbers, Israeli IDs (Teudat Zehut), addresses
-- **Custom word removal**: Use `/replace word1, word2, ...` to specify custom words/names/numbers to remove instead
+- **Custom word removal**: send names/words/numbers as plain text (no commands) and they are removed from your next files too, on top of automatic PII removal
 - English-language document support with Israeli PII pattern detection (Teudat Zehut IDs, 05X/+972 phone numbers)
 - Strips all document metadata (author, dates, creator, etc.)
 - Securely deletes all files after processing (overwrite + unlink)
@@ -37,11 +37,11 @@ main.py → SignalBot → CleaningPipeline → PDFCleaner / DOCXCleaner → PIID
 
 | Module | Description |
 |---|---|
-| `signal_bot.py` | Signal bot with `/replace` and `/end` commands, rate limiting, sender allowlist |
-| `word_session_store.py` | Per-sender custom word storage with 1-hour TTL for `/replace` command |
+| `signal_bot.py` | Signal bot: plain-text custom words (no commands), per-file summary, rate limiting, sender allowlist |
+| `word_session_store.py` | Per-sender custom word list, in memory only, cleared after 2 hours of inactivity |
 | `processor/pipeline.py` | Orchestrates cleaning, enforces timeout |
 | `processor/pii_detector.py` | Presidio + spaCy English NER with Israeli regex recognizers |
-| `processor/custom_word_detector.py` | Case-insensitive text matching for user-specified custom words |
+| `processor/custom_word_detector.py` | Whole-word, case-insensitive matching of custom words (Hebrew prefixes allowed), on top of the automatic detector; counts hits per file |
 | `processor/pdf_cleaner.py` | PDF text cleaning + metadata stripping |
 | `processor/docx_cleaner.py` | DOCX cleaning (paragraphs, tables, headers/footers) + metadata |
 | `processor/metadata.py` | PDF and DOCX metadata stripping |
@@ -168,10 +168,10 @@ All configuration is done via environment variables or a `.env` file.
 | `ALLOWED_SENDERS` | **Required.** Comma-separated allowlist of Signal UUIDs (not phone numbers). Missing, empty or any invalid entry stops startup | — |
 | `SIGNAL_MAX_SEND_BYTES` | Largest send body the wrapper accepts (its `MAX_BODY_BYTES`); bigger cleaned files are not sent and the user is told | `40000000` |
 | `HEARTBEAT_FILE` | File touched on every frame/pong from the receive stream; used by the Docker healthcheck | (unset) |
-| `WORD_SESSION_TTL_SECONDS` | TTL for `/replace` custom word sessions | `3600` (1 hour) |
-| `MAX_WORDS_PER_SENDER` | Maximum custom words per `/replace` session | `15` |
+| `WORD_SESSION_TTL_SECONDS` | A sender's custom word list is cleared after this many seconds with no message or file | `7200` (2 hours) |
+| `MAX_WORDS_PER_SENDER` | Maximum custom words per sender | `30` |
 | `MAX_WORD_LENGTH` | Maximum length per custom word | `100` |
-| `MAX_WORD_SESSIONS` | Maximum concurrent `/replace` sessions | `100` |
+| `MAX_WORD_SESSIONS` | Maximum senders with a word list at the same time | `100` |
 
 For strongest PII protection, mount `TEMP_DIR` on a `tmpfs` volume so temporary files never touch disk.
 
@@ -181,31 +181,48 @@ For strongest PII protection, mount `TEMP_DIR` on a `tmpfs` volume so temporary 
 
 Send a PDF or DOCX file to the bot. It will automatically detect and remove all PII (names, emails, phone numbers, IDs, addresses) and return the cleaned document.
 
-### Custom Word Removal (`/replace` command)
+### Custom Word Removal (plain text, no commands)
 
-Specify custom words to remove instead of automatic PII detection:
+Send the names, words or numbers to remove as a normal message. They are removed from every file you send next, **in addition to** automatic PII removal (never instead of it). Separate them with commas or new lines; spaces stay inside a phrase.
 
 ```
-User: /replace Amit, Joni, David Cohen
-Bot:  3 word(s) added (3 total active).
-      These words will be removed from documents sent in the next hour.
-      Send /end to clear.
+me  → Amit Levi, דני כהן
+bot → Will remove: Amit Levi, דני כהן (+ automatic PII).
+      Kept for 2h after your last message.
+      Wrong one? Send -word. Clear all: 0
+me  → [contract.pdf]
+bot → [cleaned.pdf]
+bot → Removed: Amit Levi ×4, דני כהן ×0 + 6 automatic (2 phone, 1 ID, 3 email).
+      Not found: דני כהן. Try another spelling?
+me  → -דני כהן
+bot → Removed: דני כהן.
+      Your list: Amit Levi
+      Kept for 2h after your last message.
+      Wrong one? Send -word. Clear all: 0
+me  → [lease.docx]  (caption: Ruti)
+bot → [cleaned.docx]
+bot → Removed: Amit Levi ×2, Ruti ×3 + 2 automatic (1 phone, 1 email).
+me  → רשימה
+bot → Your words (copy and send to reuse later):
+      Amit Levi, Ruti
 ```
 
-Then send documents — all occurrences of those words will be removed (case-insensitive).
+| Send | Does |
+|---|---|
+| `Amit Levi, Ruti` (any text) | Adds words to your list |
+| a file with a caption | Adds the caption's words, then cleans the file (no extra confirmation) |
+| `-Ruti` | Takes one word off the list |
+| `list` / `רשימה` | Shows the list as one line you can copy and send again later |
+| `0` / `clear` / `נקה` | Clears the list |
+| `help` / `עזרה` / `?` | Help, with what is active right now |
 
-**Features:**
-- Words accumulate: send `/replace Amit` then `/replace Joni` and both will be removed
-- Supports multi-word phrases: `/replace David Cohen, רחוב הרצל` (English and Hebrew)
-- Case-insensitive matching: `/replace amit` removes "Amit", "AMIT", "amit"
-- 1-hour expiration: words are automatically cleared after 1 hour of inactivity
-- Per-sender isolation: each user's custom words don't affect others
-
-**Clear custom words:**
-```
-User: /end
-Bot:  Custom words cleared. Back to automatic PII detection.
-```
+- Matching is whole-word and case-insensitive: `Dan` does not touch "Jordan", `43` does not touch "1435". Hebrew words also match after prefix letters (ו ה ב ל מ ש כ): `דני` removes it from "לדני", keeping the "ל".
+- Chat replies like `thanks` / `תודה` / `ok`, emoji, single characters and links are never stored as words.
+- The list lives in memory only. It is cleared after 2 hours with no message or file (every message or file restarts the clock), by `0`, or by a restart. To reuse a list later, send `list` and keep the reply: paste it back any time.
+- After each file the bot sends a separate summary: custom words by name with a count (a ×0 shows a spelling that didn't match), automatic PII as counts per type only. The summary is never the cleaned file's caption, so forwarding the file does not forward the names.
+- Automatic name detection is English only, so add Hebrew names as words.
+- Known limitation: in PDFs, a matched word is blanked with PyMuPDF's text search, which can also blank the same letters inside a longer word on that page. DOCX output is exact.
+- The old `/replace a, b` still works (with a hint that no command is needed); `/end` clears.
 
 ## Docker Architecture
 

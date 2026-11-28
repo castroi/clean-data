@@ -69,8 +69,8 @@ class Config:
     # Touched on every frame/pong from the receive stream; the Docker
     # healthcheck checks its age. Empty disables it.
     HEARTBEAT_FILE: str = os.getenv("HEARTBEAT_FILE", "")
-    WORD_SESSION_TTL_SECONDS: int = int(os.getenv("WORD_SESSION_TTL_SECONDS", "3600"))
-    MAX_WORDS_PER_SENDER: int = int(os.getenv("MAX_WORDS_PER_SENDER", "15"))
+    WORD_SESSION_TTL_SECONDS: int = int(os.getenv("WORD_SESSION_TTL_SECONDS", "7200"))
+    MAX_WORDS_PER_SENDER: int = int(os.getenv("MAX_WORDS_PER_SENDER", "30"))
     MAX_WORD_LENGTH: int = int(os.getenv("MAX_WORD_LENGTH", "100"))
     MAX_WORD_SESSIONS: int = int(os.getenv("MAX_WORD_SESSIONS", "100"))
 

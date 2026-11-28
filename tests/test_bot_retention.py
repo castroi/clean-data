@@ -35,6 +35,8 @@ PDF = b"%PDF-1.4 fake original with John Smith"
 class FakePipeline:
     """Writes the cleaned file like the real pipeline; can fail mid-way."""
 
+    detector = None  # no automatic PII detector: the bot's wrapper then finds custom words only
+
     def __init__(self, fail_with: BaseException | None = None, cleaned: bytes = b"%PDF cleaned"):
         self.fail_with = fail_with
         self.cleaned = cleaned
@@ -127,7 +129,8 @@ def test_processed_original_deleted_before_processing(tmp_path):
 
     assert events == ["delete", "process"]  # original gone before the long step
     assert _deleted(bot) == ["att1"]        # and not deleted twice
-    assert _texts(bot)[-1] == DONE_MESSAGE
+    # The file goes back with the PII-free caption; the summary follows separately.
+    assert _texts(bot)[-2:] == [DONE_MESSAGE, "Removed: no automatic PII found.\nNo custom words active."]
     assert list((tmp_path / "temp").iterdir()) == []
 
 
